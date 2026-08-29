@@ -1,0 +1,61 @@
+# The distribution is `punctual-scheduler` (the bare `punctual` name on PyPI is a
+# dead 2019 dotfile manager); the import package and the CLI are both `punctual`.
+[project]
+name = "punctual-scheduler"
+version = "0.0.0"
+description = "The reliability layer cron never had: retries, catch-up, dependencies, observability, exactly-once. One process, zero infra."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "John Matti" }]
+keywords = ["cron", "scheduler", "jobs", "sre", "reliability", "daemon"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
+
+dependencies = [
+    "click>=8.1",       # CLI
+    "croniter>=3.0",    # cron-expression math + DST handling - do not hand-roll this
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+punctual = "punctual.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/TheJohnMatti/punctual"
+Source = "https://github.com/TheJohnMatti/punctual"
+Issues = "https://github.com/TheJohnMatti/punctual/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/punctual"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

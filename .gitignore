@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+
+# punctual runtime state (never commit a state DB)
+*.db
+*.db-wal
+*.db-shm
+punctual.toml.local
+state/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

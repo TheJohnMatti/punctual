@@ -1,0 +1,27 @@
+# Example config. `punctual validate -c examples/punctual.toml` to check it.
+
+[job.scrape]
+schedule  = "*/10 * * * *"
+command   = "python -m sniper.scrape"
+on_missed = "skip"                       # newest data only - a missed poll is worthless
+
+[job.descriptions]
+schedule  = "*/30 * * * *"
+command   = ["python", "-m", "sniper.fetch_descriptions", "--batch", "40"]
+timeout   = "20m"
+concurrency = 1
+
+[job.retrain]
+schedule  = "0 8 * * 1"                   # Mondays 08:00
+timezone  = "America/Toronto"
+command   = "python -m sniper.retrain"
+after     = ["scrape"]
+timeout   = "1h"
+retries   = { max = 2, backoff = "exponential", base_delay = "2m" }
+on_fail   = "ntfy://auto-sniper-alerts"
+
+[job.nightly-backup]
+schedule  = "0 3 * * *"
+command   = "restic backup /home/me/code"
+on_missed = "run_latest"                  # laptop was asleep at 3am? back it up now
+retries   = { max = 3 }
