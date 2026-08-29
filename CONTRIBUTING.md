@@ -29,3 +29,18 @@ uv run pre-commit install    # ruff + hygiene hooks on every commit
 - Every non-obvious design choice gets an entry in [`docs/DESIGN.md`](docs/DESIGN.md).
 - Keep the runtime dependency set minimal (currently `click` + `croniter` — see
   DESIGN D7).
+
+## Releasing
+
+Releases are tag-driven. `version` in `pyproject.toml` is the source of truth.
+
+```console
+# bump version in pyproject.toml, commit via PR, then:
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+The `release` workflow builds the sdist + wheel, publishes to PyPI via OIDC
+trusted publishing (no API token), and opens a GitHub Release. One-time PyPI
+setup: add a trusted publisher for `punctual-scheduler` pointing at this repo's
+`release.yml` / `pypi` environment.
