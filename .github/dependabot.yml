@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # GitHub Actions in .github/workflows/*
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # Python deps (pyproject). Runtime set is deliberately tiny (DESIGN D7); this
+  # mostly tracks the dev toolchain.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: build

@@ -34,6 +34,7 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    "pytest-cov>=5",
 ]
 
 [project.scripts]
@@ -54,6 +55,21 @@ packages = ["src/punctual"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["punctual"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+# Ratchet this up as each milestone lands. The gap today is the deliberately
+# unimplemented stubs (cli, scheduler, executor); the M0 modules sit at 86-100%.
+fail_under = 60
+exclude_also = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+]
 
 [tool.ruff]
 line-length = 100
