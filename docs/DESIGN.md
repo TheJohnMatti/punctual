@@ -70,28 +70,62 @@ Proposed v0 fields per `[job.<name>]`:
 | `enabled` | bool | default true |
 | `workdir`, `env`, `user` | | cron-parity knobs |
 
-Questions: default `on_missed`? per-job timezone or global? `command` as string
-(shell) vs list (exec) — support both or pick one?
+**Decided:** default `on_missed = run_latest` — differs from cron (so we're
+adding value) without the `run_each` stampede footgun.
+
+Still open: per-job timezone or global? `command` as string (shell) vs list
+(exec) — support both or pick one? (currently: both; string is shlex-split, not
+shell.)
 
 ### O2 — Run state machine
-Proposed states: `PENDING → CLAIMED → RUNNING → {SUCCEEDED, FAILED, TIMED_OUT, LOST}`
-plus `RETRYING`, `QUARANTINED`, `SKIPPED`.
+States: `PENDING → CLAIMED → RUNNING → {SUCCEEDED, FAILED, TIMED_OUT, LOST}`
+plus `RETRYING`, `QUARANTINED`, `SKIPPED`. `CLAIMED` (row written, subprocess not
+yet spawned) is kept distinct from `RUNNING` — the crash window between them
+needs different handling.
 
-- `CLAIMED` vs `RUNNING`: is the gap worth it? (claim = row written, process not
-  yet spawned — matters for exactly-once under a crash in that window)
-- `LOST`: a run that was `RUNNING` when the daemon died. How is it detected on
-  restart — heartbeat column? pid liveness check? Both?
+### O2b — Recovering a run whose daemon died mid-flight  *(needs decision)*
+Daemon spawns job X at 03:00, daemon is `kill -9`'d at 03:02. The subprocess may
+have: (A) died with it, (B) kept running (reparented to init), (C) finished
+cleanly in the gap and we have no record.
 
-### O3 — Catch-up / restart semantics (the hard one)
+What we can record to tell these apart:
+- **PID + PID-start-time** on the RUNNING row → on restart, is that pid alive
+  with a matching start time? Alive ⇒ (B), adoptable. Dead ⇒ (A) or (C).
+- **`heartbeat_at`** bumped every N s while supervised → tells us the *daemon*
+  died, not whether the *work* did.
+- **exit-code sentinel**: wrap the command so on exit it writes
+  `<run_dir>/exit`. Costs nothing, needs no cooperation from the job, and makes
+  (C) fully recoverable.
+
+Proposed recovery on restart, per non-terminal run:
+1. pid alive + start-time matches → **adopt** (re-supervise, re-arm timeout from
+   `started_at`, reattach output). A daemon restart shouldn't kill your jobs.
+2. pid dead + sentinel present → resolve from the sentinel's exit code; emit
+   `recovered_from_sentinel`.
+3. pid dead + no sentinel → `LOST` (loud: event + `lost_runs_total` metric,
+   never folded into success/failure), then apply **`on_lost`**.
+
+Open sub-decisions:
+- `on_lost` default: `retry` (new attempt) vs `fail` (page, don't touch). Lean
+  `retry`, with a per-job `idempotent = false` flipping it to `fail`.
+- Adoption requires spawning jobs in their own session/process-group so they
+  survive the daemon — which means `punctual` Ctrl-C no longer kills jobs.
+  Acceptable? (`punctual stop --kill` for the other behaviour.)
+- Do we need `on_lost = "assume_success"` for fire-and-forget jobs?
+
+### O3 — Catch-up / restart semantics
 On daemon start, for each job, look at `last_fire` vs `now` and the schedule:
 - `skip`: set the clock forward to the next future fire, log the skipped fires.
-- `run_latest`: run once immediately, then resume.
-- `run_each`: enqueue every missed fire (coalesced? rate-limited? what stops this
-  from stampeding a downstream DB — the Airflow footgun?).
+- `run_latest` *(default)*: run once immediately, then resume.
+- `run_each`: enqueue every missed fire.
 
-Also: what about a job that was mid-run when we crashed? Re-run it, or assume it
-finished? (Depends on idempotency — which we can't assume. Probably: mark `LOST`,
-re-run only if `on_missed != skip`.)
+**Decided:** `run_each` takes an optional `catch_up_cap` (int). Default is a
+sane bound (proposed: 25); `catch_up_cap = 0` means **uncapped** — some services
+genuinely require exactly N executions per N periods and that must be
+expressible. When the cap bites we log which fires were dropped and emit a
+`catch_up_capped` event/metric so it's never silent.
+
+The mid-run-when-we-crashed case is its own decision — see O2b.
 
 ### O4 — Exactly-once primitive
 Claim = `INSERT OR IGNORE INTO runs(job, scheduled_for, ...)` keyed on
