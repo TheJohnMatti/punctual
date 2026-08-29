@@ -21,3 +21,6 @@ state/
 .vscode/
 *.swp
 .DS_Store
+
+# uv (not committed — dev envs resolve from pyproject; revisit if we adopt `uv sync` in CI)
+uv.lock
