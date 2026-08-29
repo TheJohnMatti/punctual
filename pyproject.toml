@@ -32,6 +32,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "hypothesis>=6",
     "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
 ]
 
 [project.scripts]
@@ -59,3 +61,13 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]  # tests get their guarantees from running, not from mypy
+
+# croniter ships no type stubs
+[[tool.mypy.overrides]]
+module = "croniter.*"
+ignore_missing_imports = true

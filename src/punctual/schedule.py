@@ -32,7 +32,8 @@ def next_fire(expr: str, after: datetime, tz: str = "UTC") -> datetime:
     """First fire strictly after ``after`` (which may be naive or tz-aware)."""
     zone = ZoneInfo(tz)
     base = after.astimezone(zone) if after.tzinfo else after.replace(tzinfo=zone)
-    return croniter(normalize(expr), base).get_next(datetime)
+    nxt: datetime = croniter(normalize(expr), base).get_next(datetime)
+    return nxt
 
 
 def fires_between(expr: str, start: datetime, end: datetime, tz: str = "UTC") -> Iterator[datetime]:
@@ -47,7 +48,7 @@ def fires_between(expr: str, start: datetime, end: datetime, tz: str = "UTC") ->
     start = start.astimezone(zone) if start.tzinfo else start.replace(tzinfo=zone)
     end = end.astimezone(zone) if end.tzinfo else end.replace(tzinfo=zone)
     it = croniter(normalize(expr), start)
-    last_wall: tuple | None = None
+    last_wall: tuple[int, ...] | None = None
     while True:
         nxt = it.get_next(datetime)
         if nxt > end:
