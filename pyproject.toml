@@ -62,9 +62,8 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
-# Ratchet this up as each milestone lands. The gap today is the deliberately
-# unimplemented stubs (cli, scheduler, executor); the M0 modules sit at 86-100%.
-fail_under = 60
+# Ratchet this up as each milestone lands. M1 slice 1: whole tree at ~87%.
+fail_under = 82
 exclude_also = [
     "raise NotImplementedError",
     "if TYPE_CHECKING:",

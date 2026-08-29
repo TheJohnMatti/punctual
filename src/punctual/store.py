@@ -17,6 +17,9 @@ from typing import Protocol
 
 from punctual.models import Run, RunState
 
+# Bump when SCHEMA changes; add the matching step to _migrate().
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id             INTEGER PRIMARY KEY,
@@ -29,6 +32,10 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at    TEXT,
     exit_code      INTEGER,
     heartbeat_at   TEXT,
+    pid            INTEGER,                -- child pid while RUNNING (O2b)
+    pid_start_time TEXT,                   -- pid identity check on restart (O2b)
+    stdout_tail    TEXT,                   -- O5: last N bytes, decoded
+    stderr_tail    TEXT,
     created_at     TEXT NOT NULL,
     UNIQUE (job, scheduled_for, attempt)   -- DESIGN O4: the claim key
 );
@@ -42,6 +49,29 @@ CREATE TABLE IF NOT EXISTS job_clock (
     last_fire  TEXT NOT NULL
 );
 """
+
+# Additive column adds for DBs created before a given SCHEMA_VERSION. Guarded by
+# PRAGMA table_info so it is safe to run against a fresh DB too (all no-ops).
+_ADDED_COLUMNS = {
+    "runs": {
+        "pid": "INTEGER",
+        "pid_start_time": "TEXT",
+        "stdout_tail": "TEXT",
+        "stderr_tail": "TEXT",
+    },
+}
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    (version,) = db.execute("PRAGMA user_version").fetchone()
+    if version >= SCHEMA_VERSION:
+        return
+    for table, columns in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def _utc(dt: datetime) -> str:
@@ -92,6 +122,7 @@ class SqliteStore:
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(SCHEMA)
+        _migrate(self._db)
 
     # --- the exactly-once boundary -----------------------------------------
     def claim(self, job: str, scheduled_for: datetime, by: str, attempt: int = 1) -> Run | None:
@@ -111,13 +142,18 @@ class SqliteStore:
     def mark(self, run: Run) -> None:
         self._db.execute(
             "UPDATE runs SET state=?, started_at=?, finished_at=?, exit_code=?, "
-            "heartbeat_at=? WHERE id=?",
+            "heartbeat_at=?, pid=?, pid_start_time=?, stdout_tail=?, stderr_tail=? "
+            "WHERE id=?",
             (
                 run.state.value,
                 _utc(run.started_at) if run.started_at else None,
                 _utc(run.finished_at) if run.finished_at else None,
                 run.exit_code,
                 _utc(run.heartbeat_at) if run.heartbeat_at else None,
+                run.pid,
+                run.pid_start_time,
+                run.stdout_tail,
+                run.stderr_tail,
                 run.id,
             ),
         )
@@ -171,4 +207,8 @@ class SqliteStore:
             finished_at=_parse(r["finished_at"]),
             exit_code=r["exit_code"],
             heartbeat_at=_parse(r["heartbeat_at"]),
+            pid=r["pid"],
+            pid_start_time=r["pid_start_time"],
+            stdout_tail=r["stdout_tail"],
+            stderr_tail=r["stderr_tail"],
         )
