@@ -13,7 +13,7 @@ from pathlib import Path
 
 from croniter import croniter
 
-from punctual.models import Backoff, Job, MissedPolicy, RetryPolicy
+from punctual.models import Backoff, Job, MissedPolicy, OnLost, RetryPolicy
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -25,6 +25,8 @@ _JOB_KEYS = {
     "retries",
     "timeout",
     "after",
+    "idempotent",
+    "on_lost",
     "concurrency",
     "quarantine_after",
     "on_fail",
@@ -108,6 +110,7 @@ def _build_job(name: str, raw: dict) -> Job:
         timezone=raw.get("timezone", "UTC"),
         retries=_retry_policy(raw.get("retries", {}), name),
         after=list(raw.get("after", [])),
+        idempotent=bool(raw.get("idempotent", False)),
         concurrency=int(raw.get("concurrency", 1)),
         quarantine_after=int(raw.get("quarantine_after", 5)),
         on_fail=raw.get("on_fail"),
@@ -121,6 +124,13 @@ def _build_job(name: str, raw: dict) -> Job:
         except ValueError as e:
             raise ConfigError(
                 f"job {name!r}: on_missed must be one of {[m.value for m in MissedPolicy]}"
+            ) from e
+    if "on_lost" in raw:
+        try:
+            job.on_lost = OnLost(raw["on_lost"])
+        except ValueError as e:
+            raise ConfigError(
+                f"job {name!r}: on_lost must be one of {[o.value for o in OnLost]}"
             ) from e
     if "timeout" in raw:
         job.timeout = parse_duration(raw["timeout"])
