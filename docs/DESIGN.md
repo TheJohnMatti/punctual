@@ -65,6 +65,8 @@ Proposed v0 fields per `[job.<name>]`:
 | `retries` | table | `{ max, backoff, max_delay }` |
 | `timeout` | duration | kill + mark failed after this |
 | `after` | list[str] | dependency edges (later milestone) |
+| `idempotent` | bool | default `false`; safe to re-run. Drives process-group placement + `on_lost` default (O2b) |
+| `on_lost` | enum | `fail` \| `retry`; default derived from `idempotent` (O2b) |
 | `concurrency` | int | max simultaneous runs of THIS job; default 1 |
 | `on_fail` / `on_missed_alert` | URI | notification sink after quarantine |
 | `enabled` | bool | default true |
@@ -83,35 +85,64 @@ plus `RETRYING`, `QUARANTINED`, `SKIPPED`. `CLAIMED` (row written, subprocess no
 yet spawned) is kept distinct from `RUNNING` — the crash window between them
 needs different handling.
 
-### O2b — Recovering a run whose daemon died mid-flight  *(needs decision)*
+### O2b — Recovering a run whose daemon died mid-flight  *(Decided)*
 Daemon spawns job X at 03:00, daemon is `kill -9`'d at 03:02. The subprocess may
 have: (A) died with it, (B) kept running (reparented to init), (C) finished
 cleanly in the gap and we have no record.
 
-What we can record to tell these apart:
-- **PID + PID-start-time** on the RUNNING row → on restart, is that pid alive
-  with a matching start time? Alive ⇒ (B), adoptable. Dead ⇒ (A) or (C).
+What we record to tell these apart:
+- **`pid` + `pid_start_time`** on the RUNNING row → on restart, is that pid alive
+  with a matching start time? Alive ⇒ (B). Dead ⇒ (A) or (C).
 - **`heartbeat_at`** bumped every N s while supervised → tells us the *daemon*
   died, not whether the *work* did.
-- **exit-code sentinel**: wrap the command so on exit it writes
-  `<run_dir>/exit`. Costs nothing, needs no cooperation from the job, and makes
-  (C) fully recoverable.
+- **exit-code sentinel**: a wrapper process (`python -m punctual._runner
+  <run_dir> -- <argv>`, **not** a shell — D5) execs the child and writes
+  `<run_dir>/exit` with the reaped exit code. Costs nothing, needs no cooperation
+  from the job, and makes (C) fully recoverable.
 
-Proposed recovery on restart, per non-terminal run:
-1. pid alive + start-time matches → **adopt** (re-supervise, re-arm timeout from
-   `started_at`, reattach output). A daemon restart shouldn't kill your jobs.
-2. pid dead + sentinel present → resolve from the sentinel's exit code; emit
-   `recovered_from_sentinel`.
-3. pid dead + no sentinel → `LOST` (loud: event + `lost_runs_total` metric,
-   never folded into success/failure), then apply **`on_lost`**.
+**`idempotent` is the one load-bearing flag.** A per-job `idempotent` bool
+(default `false`) drives both process-group placement and the `on_lost` default:
 
-Open sub-decisions:
-- `on_lost` default: `retry` (new attempt) vs `fail` (page, don't touch). Lean
-  `retry`, with a per-job `idempotent = false` flipping it to `fail`.
-- Adoption requires spawning jobs in their own session/process-group so they
-  survive the daemon — which means `punctual` Ctrl-C no longer kills jobs.
-  Acceptable? (`punctual stop --kill` for the other behaviour.)
-- Do we need `on_lost = "assume_success"` for fire-and-forget jobs?
+| | `idempotent = false` *(default)* | `idempotent = true` |
+|---|---|---|
+| process group | shares the daemon's — Ctrl-C / daemon death kills it | own session (`start_new_session=True`) — survives daemon restart |
+| on restart, still alive | it orphaned to init (daemon was `kill -9`'d). **Kill the orphan**, then `LOST`. Unsupervised non-idempotent work has no timeout enforcement and no output capture — it's a liability, not an asset. | **adopt**: re-arm timeout from `started_at`, poll `pid`+`pid_start_time`, resolve via sentinel. Counts against `concurrency`. Output has a gap for the daemon-down window (pipes died with the old daemon; can't reattach). |
+| `on_lost` default | `fail` | `retry` |
+
+Explicit `on_lost = "fail" | "retry"` overrides the derived default either way.
+
+Recovery on restart, per non-terminal run:
+1. **`CLAIMED` at crash** → row written, *nothing spawned*, zero double-execution
+   risk → `RETRYING`, always. Never subject to `on_lost` (this is why `CLAIMED`
+   is a distinct state).
+2. **`RUNNING`, pid dead + sentinel present** → resolve from the sentinel's exit
+   code; emit `recovered_from_sentinel`.
+3. **`RUNNING`, pid alive** → adopt (idempotent) or kill-orphan-then-`LOST`
+   (non-idempotent), per the table above.
+4. **`RUNNING`, pid dead + no sentinel** → `LOST` (loud: event + `lost_runs_total`
+   metric, never folded into success/failure), then apply `on_lost`.
+
+`LOST` is **conditionally terminal**: `on_lost=fail` → it's the final record
+("fate unknown" is a legitimate answer); `on_lost=retry` → `LOST → RETRYING →
+CLAIMED`. `RunState.terminal` stays `False` for `LOST`; queries treat "`LOST`
+with no scheduled retry" as done rather than expanding the transition table.
+
+Recovery order on daemon start: **recover/adopt → catch-up (O3) → tick loop**.
+Adopted runs must be counted before the tick loop starts claiming, or a fresh
+fire double-spawns.
+
+**Rejected:** `on_lost = "assume_success"`. It writes a fabricated success into
+the record — the exact lie `LOST` exists to avoid (poisons the success-rate
+metric, `why`, history). If `LOST` noise from fire-and-forget jobs turns out to
+be a real complaint, add `on_lost = "ignore"` later: resolves to `LOST`
+truthfully, `lost_runs_total` still increments, but no alert and no hit to the
+job-health rollup. Not in M1 (YAGNI).
+
+**Shutdown verbs** (fallout of own-process-group adoption):
+- first SIGINT → `drain`: stop claiming, let in-flight finish, exit.
+- second SIGINT → escalate to `stop --kill`: SIGTERM → grace → SIGKILL
+  everything, idempotent groups included.
+- `punctual drain` / `punctual stop --kill` as explicit commands.
 
 ### O3 — Catch-up / restart semantics
 On daemon start, for each job, look at `last_fire` vs `now` and the schedule:

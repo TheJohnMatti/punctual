@@ -4,7 +4,7 @@ from datetime import timedelta
 import pytest
 
 from punctual.config import ConfigError, load_config, parse_duration
-from punctual.models import Backoff, MissedPolicy
+from punctual.models import Backoff, MissedPolicy, OnLost
 
 
 def write(tmp_path, body: str):
@@ -59,6 +59,35 @@ def test_full_job(tmp_path):
     assert jobs["scrape"].missed is MissedPolicy.SKIP
 
 
+def test_on_lost_defaults_derive_from_idempotent(tmp_path):
+    cfg = write(
+        tmp_path,
+        """
+        [job.plain]
+        schedule = "0 * * * *"
+        command = "true"
+
+        [job.safe]
+        schedule = "0 * * * *"
+        command = "true"
+        idempotent = true
+
+        [job.override]
+        schedule = "0 * * * *"
+        command = "true"
+        idempotent = true
+        on_lost = "fail"
+    """,
+    )
+    jobs = {j.name: j for j in load_config(cfg)}
+    assert jobs["plain"].idempotent is False
+    assert jobs["plain"].on_lost is None
+    assert jobs["plain"].effective_on_lost is OnLost.FAIL
+    assert jobs["safe"].effective_on_lost is OnLost.RETRY
+    assert jobs["override"].on_lost is OnLost.FAIL
+    assert jobs["override"].effective_on_lost is OnLost.FAIL
+
+
 @pytest.mark.parametrize(
     "body,msg",
     [
@@ -70,6 +99,10 @@ def test_full_job(tmp_path):
             "on_missed must be",
         ),
         ("[job.a]\nschedule='@daily'\ncommand='true'\nafter=['ghost']", "unknown job 'ghost'"),
+        (
+            "[job.x]\nschedule='0 3 * * *'\ncommand='true'\non_lost='maybe'",
+            "on_lost must be",
+        ),
         ("", r"no \[job"),
     ],
 )

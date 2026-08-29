@@ -28,6 +28,17 @@ class Backoff(enum.StrEnum):
     EXPONENTIAL = "exponential"
 
 
+class OnLost(enum.StrEnum):
+    """What to do with a run declared LOST (DESIGN O2b).
+
+    The default is *derived* from Job.idempotent (false -> FAIL, true -> RETRY);
+    an explicit value on the job overrides that.
+    """
+
+    FAIL = "fail"  # LOST is the final record; page, don't touch
+    RETRY = "retry"  # LOST -> RETRYING -> CLAIMED (new attempt)
+
+
 class RunState(enum.StrEnum):
     """DESIGN O2 - proposed. Transitions enforced in Run.transition_to()."""
 
@@ -104,12 +115,21 @@ class Job:
     retries: RetryPolicy = field(default_factory=RetryPolicy)
     timeout: timedelta | None = None
     after: list[str] = field(default_factory=list)  # dependency edges (M4)
+    idempotent: bool = False  # safe to re-run; drives process group + on_lost (O2b)
+    on_lost: OnLost | None = None  # None -> derive from idempotent (O2b)
     concurrency: int = 1  # max simultaneous runs of THIS job
     quarantine_after: int = 5  # consecutive failures -> QUARANTINED
     on_fail: str | None = None  # notification URI
     workdir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+
+    @property
+    def effective_on_lost(self) -> OnLost:
+        """The on_lost policy after applying the idempotent-derived default (O2b)."""
+        if self.on_lost is not None:
+            return self.on_lost
+        return OnLost.RETRY if self.idempotent else OnLost.FAIL
 
 
 @dataclass(slots=True)
@@ -126,6 +146,8 @@ class Run:
     finished_at: datetime | None = None
     exit_code: int | None = None
     heartbeat_at: datetime | None = None  # LOST detection (DESIGN O2)
+    pid: int | None = None  # child pid while RUNNING (O2b recovery)
+    pid_start_time: str | None = None  # pid identity check on restart (O2b)
 
     def transition_to(self, new: RunState) -> None:
         allowed = _TRANSITIONS.get(self.state, set())
