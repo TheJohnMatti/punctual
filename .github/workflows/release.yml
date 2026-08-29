@@ -1,0 +1,59 @@
+name: release
+
+# Cut a release by pushing a tag:  git tag v0.0.1 && git push origin v0.0.1
+# Builds sdist + wheel, publishes to PyPI via OIDC trusted publishing (no token),
+# and creates a GitHub Release with the artifacts attached.
+#
+# One-time setup on PyPI (cannot be done from CI): add a trusted publisher for
+# project `punctual-scheduler` — owner `TheJohnMatti`, repo `punctual`,
+# workflow `release.yml`, environment `pypi`.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx run build
+      - run: pipx run twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
