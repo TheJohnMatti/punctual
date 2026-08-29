@@ -52,6 +52,11 @@ def _parse(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s) if s else None
 
 
+def _parse_req(s: str) -> datetime:
+    """For NOT NULL timestamp columns."""
+    return datetime.fromisoformat(s)
+
+
 def default_db_path() -> Path:
     """XDG state dir, overridable via $PUNCTUAL_DB."""
     import os
@@ -158,7 +163,7 @@ class SqliteStore:
         return Run(
             id=r["id"],
             job=r["job"],
-            scheduled_for=_parse(r["scheduled_for"]),
+            scheduled_for=_parse_req(r["scheduled_for"]),
             state=RunState(r["state"]),
             attempt=r["attempt"],
             claimed_by=r["claimed_by"],

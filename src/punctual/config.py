@@ -10,6 +10,7 @@ from __future__ import annotations
 import tomllib
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from croniter import croniter
 
@@ -68,7 +69,7 @@ def _as_argv(command: str | list[str], job: str) -> list[str]:
     raise ConfigError(f"job {job!r}: command must be a string or list of strings")
 
 
-def _retry_policy(raw: dict, job: str) -> RetryPolicy:
+def _retry_policy(raw: dict[str, Any], job: str) -> RetryPolicy:
     unknown = set(raw) - _RETRY_KEYS
     if unknown:
         raise ConfigError(f"job {job!r}: unknown retries keys {sorted(unknown)}")
@@ -89,7 +90,7 @@ def _retry_policy(raw: dict, job: str) -> RetryPolicy:
     return p
 
 
-def _build_job(name: str, raw: dict) -> Job:
+def _build_job(name: str, raw: dict[str, Any]) -> Job:
     if not isinstance(raw, dict):
         raise ConfigError(f"job {name!r}: expected a table")
     unknown = set(raw) - _JOB_KEYS
