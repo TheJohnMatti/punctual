@@ -148,6 +148,14 @@ class Run:
     heartbeat_at: datetime | None = None  # LOST detection (DESIGN O2)
     pid: int | None = None  # child pid while RUNNING (O2b recovery)
     pid_start_time: str | None = None  # pid identity check on restart (O2b)
+    stdout_tail: str | None = None  # last O5.TAIL_BYTES of stdout, decoded
+    stderr_tail: str | None = None  # last O5.TAIL_BYTES of stderr, decoded
+
+    @property
+    def duration(self) -> timedelta | None:
+        if self.started_at and self.finished_at:
+            return self.finished_at - self.started_at
+        return None
 
     def transition_to(self, new: RunState) -> None:
         allowed = _TRANSITIONS.get(self.state, set())

@@ -79,6 +79,13 @@ Still open: per-job timezone or global? `command` as string (shell) vs list
 (exec) — support both or pick one? (currently: both; string is shlex-split, not
 shell.)
 
+**6-field cron (seconds).** croniter accepts a 6th field and reads it as
+*seconds, last*: `* * * * * */3` = every 3s (NOT `*/3 * * * * *`, which is every
+3 *minutes*). It works today because `schedule.py` passes straight through.
+Open: do we bless it (document + test it, useful for sub-minute jobs and the
+demo) or reject it in `config.py` as a footgun (the field order trips everyone)?
+Leaning: bless + document the ordering loudly.
+
 ### O2 — Run state machine
 States: `PENDING → CLAIMED → RUNNING → {SUCCEEDED, FAILED, TIMED_OUT, LOST}`
 plus `RETRYING`, `QUARANTINED`, `SKIPPED`. `CLAIMED` (row written, subprocess not
@@ -160,14 +167,27 @@ The mid-run-when-we-crashed case is its own decision — see O2b.
 
 ### O4 — Exactly-once primitive
 Claim = `INSERT OR IGNORE INTO runs(job, scheduled_for, ...)` keyed on
-`(job, scheduled_for)`. Same pattern proven in the auto_sniper notifier. Open:
-does the *command* get an idempotency token in its env (`PUNCTUAL_RUN_ID`) so
-the job itself can dedupe side effects? (Yes, probably.)
+`(job, scheduled_for)`. Same pattern proven in the auto_sniper notifier.
+
+**Decided (M1):** the child env carries `PUNCTUAL_RUN_ID`, `PUNCTUAL_JOB`,
+`PUNCTUAL_SCHEDULED_FOR`, `PUNCTUAL_ATTEMPT` so the job can dedupe its own side
+effects.
 
 ### O5 — Output capture
-stdout/stderr of each run: ring-buffered to a cap (default 64 KiB each?), stored
-as a SQLite BLOB vs a file under `state/runs/<id>/`. Full stream to a file always,
-tail in the DB for `punctual history`?
+**Decided (M1 slice 1):** keep the last **16 KiB** each of stdout/stderr in a
+ring buffer (`executor.TAIL_BYTES`), persisted as `stdout_tail` / `stderr_tail`
+TEXT columns on `runs`, decoded UTF-8 with `errors="replace"`. That is what
+`punctual history` shows.
+
+Still open: full stream to a file under `state/runs/<id>/` (always? opt-in?
+size cap + rotation?). Add when someone needs more than the tail — not before.
+
+### O5b — Schema migrations
+**Decided (M1):** `PRAGMA user_version` + a `_migrate()` that runs guarded
+additive `ALTER TABLE ... ADD COLUMN` (checked against `PRAGMA table_info`, so
+it is a no-op on a fresh DB). No migration framework, no down-migrations. A
+column *rename* or *type change* will need a table rebuild — cross that bridge
+when we reach it. Pre-alpha DBs with no `user_version` are treated as v0.
 
 ### O6 — Observability surface
 Prometheus text endpoint (`punctual metrics` / a port), OTel spans per run,
@@ -185,7 +205,15 @@ wedged" needs monotonic. NTP steps, laptop suspend, DST — enumerate the hazard
 - **M0 — skeleton** *(now)*: repo, config parse + validate, `Store` + SQLite impl,
   data models, CLI stubs, CI.
 - **M1 — it schedules**: daemon loop, cron → next-fire, subprocess exec + capture,
-  durable run records, `punctual run` / `list` / `history`.
+  durable run records, `punctual run` / `history`. Built in slices:
+  - *slice 1 ✅* — schedule-from-now, one fire per job per tick (run_latest
+    semantics for a slow loop), `execute()` + output tail, `SUCCEEDED / FAILED /
+    TIMED_OUT`, `run` + `history`. **Not** yet: cross-restart catch-up,
+    `_recover`, process-group kill, retries.
+  - *slice 2* — timeout → process-group SIGTERM/SIGKILL, `drain` vs
+    `stop --kill` (second signal), env-var contract polish.
+  - *slice 3* — `_recover` (O2b) + cross-restart catch-up (O3, honouring
+    `on_missed`), `job_clock` baseline.
 - **M2 — it's reliable**: retries + backoff + quarantine, timeouts, `LOST`
   detection, catch-up policies, `punctual plan` / `why`.
 - **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
