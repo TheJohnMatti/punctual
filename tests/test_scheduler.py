@@ -80,6 +80,36 @@ async def test_disabled_job_never_fires(tmp_path):
     store.close()
 
 
+async def test_records_the_child_pid(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    sched = Scheduler([_echo_job("tick")], store, "test", handle_signals=False)
+
+    await _run_briefly(sched, 2.5)
+
+    assert any(r.pid and r.pid > 0 for r in store.history("tick"))
+    store.close()
+
+
+async def test_second_stop_kills_in_flight_jobs(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    job = Job(
+        name="hang",
+        schedule="* * * * * *",
+        command=["bash", "-lc", "sleep 60"],
+    )
+    sched = Scheduler([job], store, "test", handle_signals=False)
+    task = asyncio.create_task(sched.run())
+    await asyncio.sleep(2.0)  # let a run get going
+
+    sched._request_stop()  # drain
+    sched._request_stop()  # stop --kill
+    await asyncio.wait_for(task, timeout=10)  # must not wait out the 60s sleep
+
+    runs = store.history("hang")
+    assert runs and runs[0].state is RunState.FAILED
+    store.close()
+
+
 async def test_skips_fires_from_before_startup(tmp_path):
     # job_clock says this job last fired an hour ago; slice 1 does NOT catch up,
     # so nothing from that gap should run.

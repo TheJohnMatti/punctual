@@ -1,14 +1,15 @@
 """The daemon (DESIGN D2). Owns the asyncio loop, decides what fires when,
 claims each fire exactly once, hands it to the executor, records the result.
 
-M1 slice 1 — "it fires": schedule-from-now, single fire per job per tick
-(run_latest semantics for a slow loop), subprocess exec + output tail, durable
-run records. Deliberately *not* here yet:
+Shutdown (slice 2): the first SIGINT/SIGTERM is a **drain** — stop claiming,
+let in-flight runs finish, exit. A second signal is **stop --kill** — SIGKILL
+every in-flight job's process group; those runs land as FAILED.
 
-  - cross-restart catch-up from job_clock (DESIGN O3) — next slice
-  - LOST detection / adopt-or-kill on restart (DESIGN O2b) — next slice
+Deliberately *not* here yet:
+
+  - cross-restart catch-up from job_clock (DESIGN O3) — slice 3
+  - LOST detection / adopt-or-kill on restart (DESIGN O2b) — slice 3
   - retries / backoff / quarantine (DESIGN M2)
-  - hard-kill on second signal (`stop --kill`) — next slice
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from punctual.executor import execute
+from punctual.executor import execute, kill_group
 from punctual.models import Job, Run, RunState
 from punctual.schedule import next_fire
 from punctual.store import Store
@@ -41,6 +42,7 @@ class Scheduler:
     _wake: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _inflight: dict[str, int] = field(default_factory=lambda: defaultdict(int), init=False)
     _since: dict[str, datetime] = field(default_factory=dict, init=False)
+    _running: dict[int, Run] = field(default_factory=dict, init=False)  # run id -> Run
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -108,12 +110,17 @@ class Scheduler:
     # --- execution -------------------------------------------------------
     async def _execute_run(self, job: Job, run: Run) -> None:
         self._inflight[job.name] += 1
+        self._running[run.id] = run  # type: ignore[index]  # id is set post-claim
         try:
             run.started_at = datetime.now(UTC)
             run.transition_to(RunState.RUNNING)
             self.store.mark(run)
 
-            outcome = await execute(job, run, timeout=job.timeout)
+            def _record_pid(pid: int) -> None:
+                run.pid = pid
+                self.store.mark(run)
+
+            outcome = await execute(job, run, timeout=job.timeout, on_spawn=_record_pid)
 
             run.finished_at = datetime.now(UTC)
             run.exit_code = outcome.exit_code
@@ -129,6 +136,7 @@ class Scheduler:
             self.store.set_last_fire(job.name, run.scheduled_for)
         finally:
             self._inflight[job.name] -= 1
+            self._running.pop(run.id, None)  # type: ignore[arg-type]
 
     async def _recover(self) -> None:
         """Runs left non-terminal by a dead daemon -> LOST, then re-decide.
@@ -155,6 +163,13 @@ class Scheduler:
                 loop.remove_signal_handler(sig)
 
     def _request_stop(self) -> None:
+        if self._stopping.is_set():
+            # second signal: stop --kill — SIGKILL every in-flight job's group.
+            # Those runs come back with a signal exit code and land as FAILED.
+            for run in list(self._running.values()):
+                if run.pid is not None:
+                    kill_group(run.pid)
+            return
         self._stopping.set()
         self._wake.set()
 

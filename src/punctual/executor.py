@@ -4,6 +4,11 @@ DESIGN D5 (subprocess first, argv not shell), O4 (idempotency token in the
 child env), O5 (output capture — tail ring-buffer; full-stream-to-file comes
 later), O2 (RUNNING -> terminal transitions live in the scheduler; this module
 just produces the raw :class:`Outcome`).
+
+Every job runs in its **own session / process group** (`start_new_session`), so
+a timeout or a `stop --kill` can take down the whole tree (a shell wrapper and
+its children), not just the direct child. Whether a job *survives* the daemon is
+a separate question, settled on restart by O2b recovery, not here.
 """
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import signal
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -20,7 +27,7 @@ from punctual.models import Job, Run
 # a full stream-to-file lands in a later slice.
 TAIL_BYTES = 16 * 1024
 
-# How long a timed-out process gets after SIGTERM before we SIGKILL it.
+# How long a process group gets after SIGTERM before it gets SIGKILL.
 _KILL_GRACE = timedelta(seconds=10)
 
 
@@ -68,12 +75,22 @@ async def _drain(stream: asyncio.StreamReader | None, ring: _Ring) -> None:
         ring.write(chunk)
 
 
-async def execute(job: Job, run: Run, *, timeout: timedelta | None) -> Outcome:
+async def execute(
+    job: Job,
+    run: Run,
+    *,
+    timeout: timedelta | None,
+    on_spawn: Callable[[int], None] | None = None,
+) -> Outcome:
     """Spawn ``job.command``, capture the output tail, enforce ``timeout``.
+
+    ``on_spawn`` is called with the child pid the moment it exists, so the
+    scheduler can persist it for restart recovery (O2b).
 
     Never raises for a non-zero exit — that is a normal :class:`Outcome`. A
     command that cannot be spawned at all (not found, not executable) comes back
-    as exit code 127 with the reason on stderr, matching a shell.
+    as exit code 127 with the reason on stderr, matching a shell. On cancellation
+    (a `stop --kill`) the process group is killed before the exception propagates.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -82,25 +99,32 @@ async def execute(job: Job, run: Run, *, timeout: timedelta | None) -> Outcome:
             env=_child_env(job, run),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # own process group -> group-wide kill
         )
     except (FileNotFoundError, PermissionError, NotADirectoryError) as e:
         return Outcome(exit_code=127, timed_out=False, stdout_tail=b"", stderr_tail=str(e).encode())
 
-    out, err = _Ring(TAIL_BYTES), _Ring(TAIL_BYTES)
+    if on_spawn is not None:
+        on_spawn(proc.pid)
 
+    out, err = _Ring(TAIL_BYTES), _Ring(TAIL_BYTES)
     timed_out = False
     try:
-        async with asyncio.timeout(timeout.total_seconds() if timeout else None):
-            await asyncio.gather(
-                proc.wait(),
-                _drain(proc.stdout, out),
-                _drain(proc.stderr, err),
-            )
-    except TimeoutError:
-        timed_out = True
+        try:
+            async with asyncio.timeout(timeout.total_seconds() if timeout else None):
+                await asyncio.gather(
+                    proc.wait(),
+                    _drain(proc.stdout, out),
+                    _drain(proc.stderr, err),
+                )
+        except TimeoutError:
+            timed_out = True
+            await _kill(proc)
+            # process is gone; flush whatever it left in the pipes
+            await asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
+    except asyncio.CancelledError:
         await _kill(proc)
-        # the process is gone now; flush whatever it left in the pipes
-        await asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
+        raise
 
     return Outcome(
         exit_code=proc.returncode if proc.returncode is not None else -1,
@@ -110,21 +134,21 @@ async def execute(job: Job, run: Run, *, timeout: timedelta | None) -> Outcome:
     )
 
 
-async def _kill(proc: asyncio.subprocess.Process) -> None:
-    """SIGTERM, then SIGKILL after a grace period.
+def kill_group(pid: int, sig: int = signal.SIGKILL) -> None:
+    """Signal the whole process group led by ``pid``. Best effort — a pid that
+    is already gone (or was never ours) is not an error."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(os.getpgid(pid), sig)
 
-    Slice 1 signals the direct child only. A shell wrapper that is waiting on its
-    own child (`bash -lc "sleep 30; ..."`) won't exit until that child does —
-    process-*group* kill lands with the O2b work in slice 2.
-    """
-    try:
-        proc.terminate()
-    except ProcessLookupError:
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """SIGTERM the whole process group, then SIGKILL it after a grace period."""
+    if proc.returncode is not None:
         return
+    kill_group(proc.pid, signal.SIGTERM)
     try:
         async with asyncio.timeout(_KILL_GRACE.total_seconds()):
             await proc.wait()
     except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        kill_group(proc.pid, signal.SIGKILL)
         await proc.wait()
