@@ -87,17 +87,21 @@ async def execute(job: Job, run: Run, *, timeout: timedelta | None) -> Outcome:
         return Outcome(exit_code=127, timed_out=False, stdout_tail=b"", stderr_tail=str(e).encode())
 
     out, err = _Ring(TAIL_BYTES), _Ring(TAIL_BYTES)
-    pumps = asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
 
     timed_out = False
     try:
         async with asyncio.timeout(timeout.total_seconds() if timeout else None):
-            await proc.wait()
+            await asyncio.gather(
+                proc.wait(),
+                _drain(proc.stdout, out),
+                _drain(proc.stderr, err),
+            )
     except TimeoutError:
         timed_out = True
         await _kill(proc)
+        # the process is gone now; flush whatever it left in the pipes
+        await asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
 
-    await pumps
     return Outcome(
         exit_code=proc.returncode if proc.returncode is not None else -1,
         timed_out=timed_out,
