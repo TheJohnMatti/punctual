@@ -108,13 +108,20 @@ What we record to tell these apart:
   `<run_dir>/exit` with the reaped exit code. Costs nothing, needs no cooperation
   from the job, and makes (C) fully recoverable.
 
+**Every job gets its own session** (`start_new_session=True`), always —
+*refined from the original "non-idempotent shares the daemon's group"*. Reason:
+per-job group isolation is what lets a `timeout` or `stop --kill` take down one
+job's whole process tree without touching the daemon or its siblings (M1
+slice 2). The consequence — jobs don't die automatically when the daemon does —
+is handled on restart by recovery, not by spawn placement.
+
 **`idempotent` is the one load-bearing flag.** A per-job `idempotent` bool
-(default `false`) drives both process-group placement and the `on_lost` default:
+(default `false`) governs what recovery does with a job it finds still running,
+and the `on_lost` default:
 
 | | `idempotent = false` *(default)* | `idempotent = true` |
 |---|---|---|
-| process group | shares the daemon's — Ctrl-C / daemon death kills it | own session (`start_new_session=True`) — survives daemon restart |
-| on restart, still alive | it orphaned to init (daemon was `kill -9`'d). **Kill the orphan**, then `LOST`. Unsupervised non-idempotent work has no timeout enforcement and no output capture — it's a liability, not an asset. | **adopt**: re-arm timeout from `started_at`, poll `pid`+`pid_start_time`, resolve via sentinel. Counts against `concurrency`. Output has a gap for the daemon-down window (pipes died with the old daemon; can't reattach). |
+| on restart, still alive | orphan from a daemon that didn't drain. **Kill the orphan**, then `LOST`. Unsupervised non-idempotent work has no timeout enforcement and no output capture — a liability, not an asset. | **adopt**: re-arm timeout from `started_at`, poll `pid`+`pid_start_time`, resolve via sentinel. Counts against `concurrency`. Output has a gap for the daemon-down window (pipes died with the old daemon; can't reattach). |
 | `on_lost` default | `fail` | `retry` |
 
 Explicit `on_lost = "fail" | "retry"` overrides the derived default either way.
@@ -211,8 +218,11 @@ wedged" needs monotonic. NTP steps, laptop suspend, DST — enumerate the hazard
     semantics for a slow loop), `execute()` + output tail, `SUCCEEDED / FAILED /
     TIMED_OUT`, `run` + `history`. **Not** yet: cross-restart catch-up,
     `_recover`, process-group kill, retries.
-  - *slice 2* — timeout → process-group SIGTERM/SIGKILL, `drain` vs
-    `stop --kill` (second signal), env-var contract polish.
+  - *slice 2 ✅* — every job in its own session; timeout / kill act on the whole
+    process group; first signal = drain, second signal = `stop --kill`
+    (SIGKILL in-flight groups → those runs land FAILED); child pid persisted.
+    Not yet: `punctual drain` / `punctual stop` CLI verbs (need a control
+    socket — deferred with `reload`/status).
   - *slice 3* — `_recover` (O2b) + cross-restart catch-up (O3, honouring
     `on_missed`), `job_clock` baseline.
 - **M2 — it's reliable**: retries + backoff + quarantine, timeouts, `LOST`

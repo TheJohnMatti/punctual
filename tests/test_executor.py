@@ -1,7 +1,7 @@
 import sys
 from datetime import datetime, timedelta
 
-from punctual.executor import TAIL_BYTES, _Ring, execute
+from punctual.executor import TAIL_BYTES, _Ring, execute, kill_group
 from punctual.models import Job, Run, RunState
 
 
@@ -60,6 +60,33 @@ async def test_timeout_kills_and_flags():
     )
     assert out.timed_out is True
     assert out.exit_code != 0
+
+
+async def test_timeout_kills_the_whole_group_not_just_the_shell():
+    # bash waits on its `sleep` child; a group-wide kill must still be fast.
+    started = datetime.now().timestamp()
+    out = await execute(
+        _job("bash", "-lc", "sleep 30; echo done", timeout=timedelta(seconds=0.3)),
+        _run(),
+        timeout=timedelta(seconds=0.3),
+    )
+    assert out.timed_out is True
+    assert datetime.now().timestamp() - started < 5  # not ~30s
+
+
+async def test_on_spawn_reports_the_pid():
+    seen: list[int] = []
+    await execute(
+        _job(sys.executable, "-c", "pass"),
+        _run(),
+        timeout=None,
+        on_spawn=seen.append,
+    )
+    assert len(seen) == 1 and seen[0] > 0
+
+
+def test_kill_group_tolerates_a_dead_pid():
+    kill_group(2**30)  # no such process — must not raise
 
 
 async def test_missing_command_is_exit_127():
