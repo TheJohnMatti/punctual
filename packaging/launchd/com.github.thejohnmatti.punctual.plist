@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  punctual as a launchd LaunchAgent (runs as you, at login).
+
+    # replace USERNAME below, then:
+    cp packaging/launchd/com.github.thejohnmatti.punctual.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.github.thejohnmatti.punctual.plist
+    tail -f ~/Library/Logs/punctual.log
+
+  launchd sends SIGTERM on stop; punctual treats it as a graceful drain.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.thejohnmatti.punctual</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/.local/bin/punctual</string>
+        <string>--config</string>
+        <string>/Users/USERNAME/.config/punctual/punctual.toml</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/Library/Logs/punctual.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/Library/Logs/punctual.log</string>
+
+    <key>ExitTimeOut</key>
+    <integer>300</integer>
+</dict>
+</plist>

@@ -1,0 +1,36 @@
+# punctual as a systemd *user* service (no root).
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/punctual.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now punctual
+#   journalctl --user -u punctual -f
+#
+# For a system-wide service, move it to /etc/systemd/system/, set User=/Group=,
+# and use absolute paths instead of %h.
+
+[Unit]
+Description=punctual — the reliability layer cron never had
+Documentation=https://github.com/TheJohnMatti/punctual
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/punctual --config %h/.config/punctual/punctual.toml run
+Restart=always
+RestartSec=2
+
+# DESIGN D2: punctual is not its own supervisor — systemd owns restarts.
+# SIGINT is a graceful drain (finish in-flight jobs, then exit); give it room.
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+# Light hardening — widen if your jobs need more.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/punctual
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

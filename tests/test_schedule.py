@@ -16,6 +16,21 @@ def test_next_fire_basic():
     )
 
 
+def test_six_field_cron_is_seconds_last():
+    # DESIGN O1: a 6th cron field is seconds, appended LAST. "* * * * * */15"
+    # fires every 15 seconds. (The seconds field is last, unlike Quartz — a
+    # documented footgun.)
+    after = datetime(2026, 1, 1, 10, 0, 3, tzinfo=ZoneInfo("UTC"))
+    fires = [after]
+    for _ in range(3):
+        fires.append(next_fire("* * * * * */15", fires[-1], "UTC"))
+    assert fires[1:] == [
+        datetime(2026, 1, 1, 10, 0, 15, tzinfo=ZoneInfo("UTC")),
+        datetime(2026, 1, 1, 10, 0, 30, tzinfo=ZoneInfo("UTC")),
+        datetime(2026, 1, 1, 10, 0, 45, tzinfo=ZoneInfo("UTC")),
+    ]
+
+
 def test_fires_between_count():
     start = datetime(2026, 1, 1, 0, 0, tzinfo=ZoneInfo("UTC"))
     end = start + timedelta(hours=1)
