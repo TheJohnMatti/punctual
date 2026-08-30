@@ -79,12 +79,13 @@ Still open: per-job timezone or global? `command` as string (shell) vs list
 (exec) — support both or pick one? (currently: both; string is shlex-split, not
 shell.)
 
-**6-field cron (seconds).** croniter accepts a 6th field and reads it as
-*seconds, last*: `* * * * * */3` = every 3s (NOT `*/3 * * * * *`, which is every
-3 *minutes*). It works today because `schedule.py` passes straight through.
-Open: do we bless it (document + test it, useful for sub-minute jobs and the
-demo) or reject it in `config.py` as a footgun (the field order trips everyone)?
-Leaning: bless + document the ordering loudly.
+**6-field cron (seconds) — Decided: bless it.** croniter reads a 6th field as
+*seconds, appended last*: `* * * * * */3` = every 3s (NOT `*/3 * * * * *`).
+Rejecting it would mean *adding* validation; blessing it is free (`schedule.py`
+already passes through). Cost: seconds-last differs from Quartz and trips
+people — mitigated by a loud README/config note and a regression test
+(`test_six_field_cron_is_seconds_last`). Sub-minute schedules are genuinely
+useful for health-check-style jobs.
 
 ### O2 — Run state machine
 States: `PENDING → CLAIMED → RUNNING → {SUCCEEDED, FAILED, TIMED_OUT, LOST}`

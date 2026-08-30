@@ -42,9 +42,39 @@ on_fail   = "ntfy://my-topic"            # page after retries are exhausted
 $ punctual run                 # start the daemon (put this under systemd/launchd)
 $ punctual plan                # next 24h of fires, timezone/DST-aware
 $ punctual history retrain     # every run: when, how long, exit code, output
-$ punctual why retrain         # explain the last scheduling decision
-$ punctual tui                 # live dashboard
+$ punctual why retrain         # explain the last scheduling decision   (coming)
+$ punctual tui                 # live dashboard                          (coming)
 ```
+
+## Quickstart
+
+```console
+$ uv tool install git+https://github.com/TheJohnMatti/punctual   # or: pipx install …
+
+$ mkdir -p ~/.config/punctual && cat > ~/.config/punctual/punctual.toml <<'EOF'
+[job.heartbeat]
+schedule = "* * * * * */30"     # every 30s — 6-field cron: seconds go LAST
+command  = "date -u +%FT%TZ"
+
+[job.backup]
+schedule = "0 3 * * *"          # 03:00 daily
+command  = "restic backup /home/me"
+EOF
+
+$ punctual -c ~/.config/punctual/punctual.toml validate
+$ punctual -c ~/.config/punctual/punctual.toml run      # Ctrl-C drains, then exits
+# ...in another shell:
+$ punctual -c ~/.config/punctual/punctual.toml history
+  09-01 14:30  heartbeat   succeeded    0.0s  exit   0
+  09-01 14:30  backup      succeeded   12.4s  exit   0
+```
+
+State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
+To keep it running, install a service — see [`packaging/`](packaging/).
+
+> **What works today (M1 slice 1):** scheduling from now, subprocess execution
+> with output capture, timeouts, durable history. **Not yet:** catch-up after
+> downtime, retries, `why` / `tui`. See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 
