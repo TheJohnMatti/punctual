@@ -159,19 +159,24 @@ job-health rollup. Not in M1 (YAGNI).
   everything, idempotent groups included.
 - `punctual drain` / `punctual stop --kill` as explicit commands.
 
-### O3 — Catch-up / restart semantics
-On daemon start, for each job, look at `last_fire` vs `now` and the schedule:
-- `skip`: set the clock forward to the next future fire, log the skipped fires.
-- `run_latest` *(default)*: run once immediately, then resume.
-- `run_each`: enqueue every missed fire.
+### O3 — Catch-up / restart semantics  *(built — M1 slice 3)*
+On daemon start, `_plan_catch_up(job)` compares `job_clock.last_fire` (the
+baseline, advanced after every terminal run *and* every recovered run) with
+`now` and applies `on_missed` to the fires in between:
+- `skip`: advance the clock to the newest missed fire, log the count.
+- `run_latest` *(default)*: replay only the newest missed fire.
+- `run_each`: replay all of them, oldest-first, in a per-job sequential task
+  (so `concurrency = 1` holds and shutdown interrupts cleanly).
 
-**Decided:** `run_each` takes an optional `catch_up_cap` (int). Default is a
-sane bound (proposed: 25); `catch_up_cap = 0` means **uncapped** — some services
-genuinely require exactly N executions per N periods and that must be
-expressible. When the cap bites we log which fires were dropped and emit a
-`catch_up_capped` event/metric so it's never silent.
+No history (`last_fire is None`) ⇒ no catch-up: a brand-new job or a fresh DB
+starts scheduling from now.
 
-The mid-run-when-we-crashed case is its own decision — see O2b.
+**Decided:** `run_each` takes `catch_up_cap` (int, per-job, **default 25**);
+`catch_up_cap = 0` means **uncapped** — some services genuinely require exactly
+N executions per N periods. When the cap bites we log at WARNING which fires
+were dropped (`catch_up_capped` metric is a M3 TODO at that log site).
+
+The mid-run-when-we-crashed case: see O2b (also built in slice 3).
 
 ### O4 — Exactly-once primitive
 Claim = `INSERT OR IGNORE INTO runs(job, scheduled_for, ...)` keyed on
@@ -223,10 +228,14 @@ wedged" needs monotonic. NTP steps, laptop suspend, DST — enumerate the hazard
     (SIGKILL in-flight groups → those runs land FAILED); child pid persisted.
     Not yet: `punctual drain` / `punctual stop` CLI verbs (need a control
     socket — deferred with `reload`/status).
-  - *slice 3* — `_recover` (O2b) + cross-restart catch-up (O3, honouring
-    `on_missed`), `job_clock` baseline.
-- **M2 — it's reliable**: retries + backoff + quarantine, timeouts, `LOST`
-  detection, catch-up policies, `punctual plan` / `why`.
+  - *slice 3 ✅* — `_recover` (O2b: resume CLAIMED, kill non-idempotent orphans,
+    LOST + `on_lost` for RUNNING) + cross-restart catch-up (O3, honouring
+    `on_missed` + `catch_up_cap`), `job_clock` baseline, `logging`-based
+    operator logs. Not yet: the exit-code sentinel (would let a lost run resolve
+    to its *real* outcome instead of LOST), true adopt-and-supervise.
+  ⇒ **M1 done** modulo the sentinel + `plan`/`why` (M2).
+- **M2 — it's reliable**: retries + backoff + quarantine, timeouts done,
+  exit-code sentinel, `punctual plan` / `why`, `punctual drain` / `stop`.
 - **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
