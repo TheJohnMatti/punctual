@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import os
 import socket
 from pathlib import Path
@@ -90,9 +91,15 @@ def plan(ctx: click.Context, hours: int) -> None:
 
 
 @main.command()
+@click.option("-v", "--verbose", is_flag=True, help="DEBUG-level logs")
 @click.pass_context
-def run(ctx: click.Context) -> None:
+def run(ctx: click.Context, verbose: bool) -> None:
     """Start the scheduler daemon (run this under systemd / launchd)."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
     jobs = _load(ctx)
     store = SqliteStore()
     n = sum(1 for j in jobs if j.enabled)

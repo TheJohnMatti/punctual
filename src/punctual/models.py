@@ -117,6 +117,7 @@ class Job:
     after: list[str] = field(default_factory=list)  # dependency edges (M4)
     idempotent: bool = False  # safe to re-run; drives process group + on_lost (O2b)
     on_lost: OnLost | None = None  # None -> derive from idempotent (O2b)
+    catch_up_cap: int = 25  # run_each: max missed fires to replay on restart; 0 = uncapped (O3)
     concurrency: int = 1  # max simultaneous runs of THIS job
     quarantine_after: int = 5  # consecutive failures -> QUARANTINED
     on_fail: str | None = None  # notification URI
