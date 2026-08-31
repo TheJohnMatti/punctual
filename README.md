@@ -1,5 +1,8 @@
 # punctual
 
+[![PyPI](https://img.shields.io/pypi/v/punctual-scheduler?include_prereleases)](https://pypi.org/project/punctual-scheduler/)
+[![CI](https://github.com/TheJohnMatti/punctual/actions/workflows/ci.yml/badge.svg)](https://github.com/TheJohnMatti/punctual/actions/workflows/ci.yml)
+
 **The reliability layer `cron` never had.** One long-running process, zero
 infrastructure, a config file that reads like a crontab — plus the five things
 every team ends up bolting onto cron by hand:
@@ -49,7 +52,7 @@ $ punctual tui                 # live dashboard                          (coming
 ## Quickstart
 
 ```console
-$ uv tool install git+https://github.com/TheJohnMatti/punctual   # or: pipx install …
+$ uv tool install --prerelease=allow punctual-scheduler   # or: pipx install --pre punctual-scheduler
 
 $ mkdir -p ~/.config/punctual && cat > ~/.config/punctual/punctual.toml <<'EOF'
 [job.heartbeat]
