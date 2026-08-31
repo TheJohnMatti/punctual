@@ -130,7 +130,8 @@ def history(ctx: click.Context, job: str | None, limit: int) -> None:
         dur = f"{r.duration.total_seconds():6.1f}s" if r.duration is not None else "       -"
         code = "  -" if r.exit_code is None else f"{r.exit_code:3d}"
         state = click.style(f"{r.state.value:10}", fg=_STATE_COLOUR.get(r.state))
-        click.echo(f"  {when}  {r.job:18}  {state}  {dur}  exit {code}")
+        att = f"#{r.attempt}" if r.attempt > 1 else "  "
+        click.echo(f"  {when}  {r.job:18} {att}  {state}  {dur}  exit {code}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ boundary (DESIGN O4). Everything else is bookkeeping.
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -18,7 +19,7 @@ from typing import Protocol
 from punctual.models import Run, RunState
 
 # Bump when SCHEMA changes; add the matching step to _migrate().
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -36,11 +37,13 @@ CREATE TABLE IF NOT EXISTS runs (
     pid_start_time TEXT,                   -- pid identity check on restart (O2b)
     stdout_tail    TEXT,                   -- O5: last N bytes, decoded
     stderr_tail    TEXT,
+    not_before     TEXT,                   -- M2: a RETRYING row is due at/after this
     created_at     TEXT NOT NULL,
     UNIQUE (job, scheduled_for, attempt)   -- DESIGN O4: the claim key
 );
 CREATE INDEX IF NOT EXISTS runs_job_sched ON runs (job, scheduled_for);
 CREATE INDEX IF NOT EXISTS runs_open      ON runs (state) WHERE finished_at IS NULL;
+CREATE INDEX IF NOT EXISTS runs_retry     ON runs (not_before) WHERE state = 'retrying';
 
 -- Last observed fire per job, so catch-up (DESIGN O3) has a baseline even across
 -- a config change that renames or removes jobs.
@@ -58,15 +61,22 @@ _ADDED_COLUMNS = {
         "pid_start_time": "TEXT",
         "stdout_tail": "TEXT",
         "stderr_tail": "TEXT",
+        "not_before": "TEXT",
     },
 }
 
 
 def _migrate(db: sqlite3.Connection) -> None:
+    """Runs *before* the SCHEMA script, so SCHEMA (which may reference a new
+    column in an index) sees an already-upgraded table. A fresh DB has no tables
+    yet — nothing to alter, SCHEMA builds it complete."""
     (version,) = db.execute("PRAGMA user_version").fetchone()
     if version >= SCHEMA_VERSION:
         return
+    tables = {r["name"] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for table, columns in _ADDED_COLUMNS.items():
+        if table not in tables:
+            continue
         have = {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns.items():
             if name not in have:
@@ -109,6 +119,19 @@ class Store(Protocol):
     def last_fire(self, job: str) -> datetime | None: ...
     def set_last_fire(self, job: str, when: datetime) -> None: ...
     def history(self, job: str | None = None, limit: int = 50) -> list[Run]: ...
+    def schedule_retry(
+        self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
+    ) -> Run | None:
+        """Create the next attempt's row (state RETRYING, due at not_before)."""
+
+    def due_retries(self, now: datetime) -> list[Run]:
+        """RETRYING rows whose not_before has passed, oldest first."""
+
+    def next_retry_at(self) -> datetime | None:
+        """Earliest not_before across all RETRYING rows."""
+
+    def run_dir(self, run_id: int) -> Path:
+        """Per-run scratch dir path (holds the exit sentinel)."""
 
 
 class SqliteStore:
@@ -121,8 +144,9 @@ class SqliteStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.executescript(SCHEMA)
         _migrate(self._db)
+        self._db.executescript(SCHEMA)
+        self.state_dir = self.path.parent if str(self.path) != ":memory:" else None
 
     # --- the exactly-once boundary -----------------------------------------
     def claim(self, job: str, scheduled_for: datetime, by: str, attempt: int = 1) -> Run | None:
@@ -142,8 +166,8 @@ class SqliteStore:
     def mark(self, run: Run) -> None:
         self._db.execute(
             "UPDATE runs SET state=?, started_at=?, finished_at=?, exit_code=?, "
-            "heartbeat_at=?, pid=?, pid_start_time=?, stdout_tail=?, stderr_tail=? "
-            "WHERE id=?",
+            "heartbeat_at=?, pid=?, pid_start_time=?, stdout_tail=?, stderr_tail=?, "
+            "not_before=? WHERE id=?",
             (
                 run.state.value,
                 _utc(run.started_at) if run.started_at else None,
@@ -154,6 +178,7 @@ class SqliteStore:
                 run.pid_start_time,
                 run.stdout_tail,
                 run.stderr_tail,
+                _utc(run.not_before) if run.not_before else None,
                 run.id,
             ),
         )
@@ -191,6 +216,40 @@ class SqliteStore:
             ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
+    # --- retries (M2) ---------------------------------------------------
+    def schedule_retry(
+        self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
+    ) -> Run | None:
+        now = _utc(datetime.now(UTC))
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO runs (job, scheduled_for, state, attempt, claimed_by, "
+            "not_before, created_at) VALUES (?,?,?,?,?,?,?)",
+            (job, _utc(scheduled_for), RunState.RETRYING.value, attempt, by, _utc(not_before), now),
+        )
+        if cur.rowcount == 0:
+            return None
+        return self._row_to_run(
+            self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        )
+
+    def due_retries(self, now: datetime) -> list[Run]:
+        rows = self._db.execute(
+            "SELECT * FROM runs WHERE state = 'retrying' AND not_before <= ? ORDER BY not_before",
+            (_utc(now),),
+        ).fetchall()
+        return [self._row_to_run(r) for r in rows]
+
+    def next_retry_at(self) -> datetime | None:
+        row = self._db.execute(
+            "SELECT MIN(not_before) AS t FROM runs WHERE state = 'retrying'"
+        ).fetchone()
+        return _parse(row["t"]) if row and row["t"] else None
+
+    def run_dir(self, run_id: int) -> Path:
+        """Per-run scratch dir (holds the exit sentinel). Not created here."""
+        base = self.state_dir or Path(tempfile.gettempdir()) / "punctual"
+        return base / "runs" / str(run_id)
+
     def close(self) -> None:
         self._db.close()
 
@@ -211,4 +270,5 @@ class SqliteStore:
             pid_start_time=r["pid_start_time"],
             stdout_tail=r["stdout_tail"],
             stderr_tail=r["stderr_tail"],
+            not_before=_parse(r["not_before"]),
         )
