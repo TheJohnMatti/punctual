@@ -64,6 +64,9 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["punctual"]
 branch = true
+omit = [
+    "src/punctual/_runner.py",  # only ever runs as a subprocess; covered by test_retries
+]
 
 [tool.coverage.report]
 show_missing = true

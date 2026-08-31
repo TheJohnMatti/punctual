@@ -85,6 +85,11 @@ class InvalidTransition(RuntimeError):
     pass
 
 
+# M2.3: a run in one of these outcomes is retried (up to RetryPolicy.max) — a
+# timed-out job is usually a transiently slow dependency, so it retries too.
+RETRYABLE_OUTCOMES = frozenset({RunState.FAILED, RunState.TIMED_OUT})
+
+
 @dataclass(slots=True)
 class RetryPolicy:
     max: int = 0
@@ -151,6 +156,7 @@ class Run:
     pid_start_time: str | None = None  # pid identity check on restart (O2b)
     stdout_tail: str | None = None  # last O5.TAIL_BYTES of stdout, decoded
     stderr_tail: str | None = None  # last O5.TAIL_BYTES of stderr, decoded
+    not_before: datetime | None = None  # M2: a RETRYING row is due at/after this
 
     @property
     def duration(self) -> timedelta | None:

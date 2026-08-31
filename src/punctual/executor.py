@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import signal
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 from punctual.models import Job, Run
 
@@ -81,20 +84,28 @@ async def execute(
     *,
     timeout: timedelta | None,
     on_spawn: Callable[[int], None] | None = None,
+    run_dir: Path | None = None,
 ) -> Outcome:
     """Spawn ``job.command``, capture the output tail, enforce ``timeout``.
 
-    ``on_spawn`` is called with the child pid the moment it exists, so the
-    scheduler can persist it for restart recovery (O2b).
+    ``on_spawn`` is called with the pid the moment it exists, so the scheduler
+    can persist it for restart recovery (O2b). When ``run_dir`` is given the
+    command runs under the ``punctual._runner`` sentinel wrapper, which writes
+    ``<run_dir>/exit`` so a lost run can be resolved to its real outcome.
 
     Never raises for a non-zero exit — that is a normal :class:`Outcome`. A
     command that cannot be spawned at all (not found, not executable) comes back
     as exit code 127 with the reason on stderr, matching a shell. On cancellation
     (a `stop --kill`) the process group is killed before the exception propagates.
     """
+    if run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        argv = [sys.executable, "-m", "punctual._runner", str(run_dir), "--", *job.command]
+    else:
+        argv = list(job.command)
     try:
         proc = await asyncio.create_subprocess_exec(
-            *job.command,
+            *argv,
             cwd=job.workdir,
             env=_child_env(job, run),
             stdout=asyncio.subprocess.PIPE,
@@ -132,6 +143,22 @@ async def execute(
         stdout_tail=out.bytes(),
         stderr_tail=err.bytes(),
     )
+
+
+@dataclass(slots=True)
+class Sentinel:
+    exit_code: int
+    signaled: bool
+
+
+def read_sentinel(run_dir: Path) -> Sentinel | None:
+    """The outcome the `_runner` wrapper recorded, or None if it never got that
+    far (no file, or a half-written one)."""
+    try:
+        data = json.loads((run_dir / "exit").read_text())
+        return Sentinel(exit_code=int(data["code"]), signaled=bool(data["signaled"]))
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def kill_group(pid: int, sig: int = signal.SIGKILL) -> None:

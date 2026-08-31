@@ -5,13 +5,18 @@ On start it (1) **recovers** runs a dead daemon left mid-flight (O2b) and
 (2) **catches up** fires that came due while it was down (O3), per each job's
 ``on_missed``. Then the tick loop takes over.
 
+Failed / timed-out runs are retried per the job's ``RetryPolicy`` (M2): a
+durable RETRYING row with a ``not_before`` timestamp, swept by the tick loop
+when its backoff elapses — so a retry pending across a restart isn't lost.
+Every run is wrapped by ``punctual._runner``, which records an exit sentinel so
+a run the daemon lost mid-flight resolves to its real outcome, not a blind LOST.
+
 Shutdown: the first SIGINT/SIGTERM is a **drain** — stop claiming, let in-flight
 runs finish, exit. A second signal is **stop --kill** — SIGKILL every in-flight
 job's process group; those runs land FAILED.
 
-Deliberately *not* here yet: retries / backoff / quarantine (M2), the
-exit-code sentinel that would let us resolve a lost run's real outcome (O2b),
-`punctual why` (M2).
+Deliberately *not* here yet: quarantine + `on_fail` notify (M2 slice 2),
+`punctual why` (M2 slice 3).
 """
 
 from __future__ import annotations
@@ -19,13 +24,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
 import signal
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from punctual.executor import execute, kill_group
-from punctual.models import InvalidTransition, Job, MissedPolicy, OnLost, Run, RunState
+from punctual.executor import Sentinel, execute, kill_group, read_sentinel
+from punctual.models import (
+    RETRYABLE_OUTCOMES,
+    InvalidTransition,
+    Job,
+    MissedPolicy,
+    OnLost,
+    Run,
+    RunState,
+)
 from punctual.process import identity_matches, pid_start_time
 from punctual.schedule import fires_between, next_fire
 from punctual.store import Store
@@ -66,6 +80,7 @@ class Scheduler:
 
                 while not self._stopping.is_set():
                     self._dispatch_due(tg)
+                    self._sweep_retries(tg)
                     await self._sleep(self._time_to_next())
             # exiting the TaskGroup waits for in-flight runs to finish (drain)
         finally:
@@ -89,6 +104,8 @@ class Scheduler:
             if job is None:  # job removed from config — just close the record
                 self._to_lost(run, note="job no longer in config")
                 continue
+            if run.state is RunState.RETRYING:
+                continue  # durable — the retry sweep will pick it up on schedule
             if run.state is RunState.CLAIMED:
                 # nothing was spawned — the fire is safe to run now, as-is.
                 log.info("resuming CLAIMED %s run %s (nothing had spawned)", run.job, run.id)
@@ -99,9 +116,17 @@ class Scheduler:
             self._advance_since(run.job, run.scheduled_for)
 
     def _recover_running(self, job: Job, run: Run, tg: asyncio.TaskGroup) -> None:
-        if run.pid is not None and identity_matches(run.pid, run.pid_start_time):
+        alive = run.pid is not None and identity_matches(run.pid, run.pid_start_time)
+
+        if not alive and run.id is not None:
+            # the wrapper may have recorded the real outcome before the daemon died
+            sentinel = read_sentinel(self.store.run_dir(run.id))
+            if sentinel is not None:
+                self._resolve_from_sentinel(job, run, sentinel)
+                return
+
+        if alive:
             if job.idempotent:
-                # harmless orphan; let it finish on its own, a fresh run is safe
                 log.warning(
                     "orphan %s run %s (pid %s) left running — idempotent, leaving it",
                     run.job,
@@ -112,17 +137,33 @@ class Scheduler:
                 log.warning(
                     "killing non-idempotent orphan %s run %s (pid %s)", run.job, run.id, run.pid
                 )
-                kill_group(run.pid)
-        self._to_lost(run, note="daemon died mid-flight")
+                kill_group(run.pid)  # type: ignore[arg-type]
+
+        self._to_lost(run, note="daemon died mid-flight, no sentinel")
         if job.effective_on_lost is OnLost.RETRY:
-            retry = self.store.claim(
-                run.job, run.scheduled_for, self.instance_id, attempt=run.attempt + 1
-            )
-            if retry is not None:
-                log.info("retrying lost %s as attempt %s", run.job, retry.attempt)
-                self._launch(job, retry, tg)
+            self._schedule_retry(job, run, delay=timedelta(0))
         else:
             log.error("LOST %s run %s — on_lost=fail, needs a human", run.job, run.id)
+
+    def _resolve_from_sentinel(self, job: Job, run: Run, sentinel: Sentinel) -> None:
+        run.finished_at = datetime.now(UTC)
+        run.exit_code = sentinel.exit_code
+        if sentinel.exit_code == 0:
+            outcome = RunState.SUCCEEDED
+        elif sentinel.signaled:
+            outcome = RunState.TIMED_OUT  # killed while unsupervised — treat as a timeout
+        else:
+            outcome = RunState.FAILED
+        run.transition_to(outcome)
+        self.store.mark(run)
+        log.info(
+            "recovered_from_sentinel: %s run %s -> %s (exit %s)",
+            run.job,
+            run.id,
+            outcome.value,
+            sentinel.exit_code,
+        )
+        self._after_terminal(job, run, outcome)
 
     def _to_lost(self, run: Run, *, note: str) -> None:
         run.finished_at = datetime.now(UTC)
@@ -217,15 +258,67 @@ class Scheduler:
 
     def _time_to_next(self) -> float:
         now = datetime.now(UTC)
-        fires = [next_fire(j.schedule, now, j.timezone) for j in self._enabled()]
-        if not fires:
+        candidates = [next_fire(j.schedule, now, j.timezone) for j in self._enabled()]
+        if (retry_at := self.store.next_retry_at()) is not None:
+            candidates.append(retry_at)
+        if not candidates:
             return MAX_SLEEP
-        return max(0.0, (min(fires) - now).total_seconds())
+        return max(0.0, (min(candidates) - now).total_seconds())
 
     async def _sleep(self, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._wake.wait(), timeout=min(seconds, MAX_SLEEP))
         self._wake.clear()
+
+    # --- retries (M2) ----------------------------------------------
+    def _sweep_retries(self, tg: asyncio.TaskGroup) -> None:
+        for run in self.store.due_retries(datetime.now(UTC)):
+            job = self._job(run.job)
+            if job is None or not job.enabled:
+                continue
+            if self._inflight[job.name] >= job.concurrency:
+                continue  # still busy; try again next tick
+            run.transition_to(RunState.CLAIMED)  # RETRYING -> CLAIMED
+            run.not_before = None
+            self.store.mark(run)
+            self._launch(job, run, tg)
+
+    def _schedule_retry(self, job: Job, run: Run, delay: timedelta) -> None:
+        not_before = datetime.now(UTC) + delay
+        retry = self.store.schedule_retry(
+            run.job, run.scheduled_for, run.attempt + 1, not_before, self.instance_id
+        )
+        if retry is not None:
+            log.info(
+                "%s run %s (%s) -> retry attempt %d, not before %s",
+                run.job,
+                run.id,
+                run.state.value,
+                retry.attempt,
+                not_before.isoformat(timespec="seconds"),
+            )
+            self._wake.set()  # make the loop re-evaluate its sleep
+
+    def _after_terminal(self, job: Job, run: Run, outcome: RunState) -> None:
+        self.store.set_last_fire(job.name, run.scheduled_for)
+        retryable = outcome in RETRYABLE_OUTCOMES
+        if retryable and run.attempt <= job.retries.max:
+            self._schedule_retry(job, run, job.retries.delay_for_attempt(run.attempt))
+            return
+        if retryable and job.retries.max:
+            log.warning(
+                "%s run %s: retries exhausted (attempt %d of %d) — %s stands",
+                run.job,
+                run.id,
+                run.attempt,
+                job.retries.max + 1,
+                outcome.value,
+            )
+        self._cleanup_run_dir(run)
+
+    def _cleanup_run_dir(self, run: Run) -> None:
+        if run.id is not None:
+            shutil.rmtree(self.store.run_dir(run.id), ignore_errors=True)
 
     # --- execution --------------------------------------------------
     def _launch(self, job: Job, run: Run, tg: asyncio.TaskGroup) -> None:
@@ -234,6 +327,7 @@ class Scheduler:
     async def _execute_run(self, job: Job, run: Run) -> None:
         self._inflight[job.name] += 1
         self._running[run.id] = run  # type: ignore[index]  # id is set post-claim
+        run_dir = self.store.run_dir(run.id) if run.id is not None else None
         try:
             run.started_at = datetime.now(UTC)
             run.transition_to(RunState.RUNNING)
@@ -244,20 +338,23 @@ class Scheduler:
                 run.pid_start_time = pid_start_time(pid)
                 self.store.mark(run)
 
-            outcome = await execute(job, run, timeout=job.timeout, on_spawn=_record_pid)
+            outcome = await execute(
+                job, run, timeout=job.timeout, on_spawn=_record_pid, run_dir=run_dir
+            )
 
             run.finished_at = datetime.now(UTC)
             run.exit_code = outcome.exit_code
             run.stdout_tail = outcome.stdout_tail.decode("utf-8", "replace")
             run.stderr_tail = outcome.stderr_tail.decode("utf-8", "replace")
             if outcome.timed_out:
-                run.transition_to(RunState.TIMED_OUT)
+                state = RunState.TIMED_OUT
             elif outcome.exit_code == 0:
-                run.transition_to(RunState.SUCCEEDED)
+                state = RunState.SUCCEEDED
             else:
-                run.transition_to(RunState.FAILED)
+                state = RunState.FAILED
+            run.transition_to(state)
             self.store.mark(run)
-            self.store.set_last_fire(job.name, run.scheduled_for)
+            self._after_terminal(job, run, state)
         finally:
             self._inflight[job.name] -= 1
             self._running.pop(run.id, None)  # type: ignore[arg-type]

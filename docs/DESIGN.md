@@ -211,6 +211,32 @@ structured JSON logs. Which are in the MVP vs later? A `/healthz` that means
 Scheduling is wall-clock (cron semantics), but drift detection / "is the loop
 wedged" needs monotonic. NTP steps, laptop suspend, DST — enumerate the hazards.
 
+### O8 — Retries  *(built — M2 slice 1)*
+- **`retries = { max = N }` means N retries *after* the first attempt** — up to
+  N+1 runs. `max = 0` (default) = one run, no retry. Matches k8s `backoffLimit`.
+- **Retryable outcomes: `FAILED` and `TIMED_OUT`** (`models.RETRYABLE_OUTCOMES`).
+  A timeout is usually a transiently slow dependency; retrying often clears it.
+- **A pending retry is durable**, not an in-memory timer: `store.schedule_retry`
+  writes the next attempt as its own row (state `RETRYING`, `not_before` = when
+  the backoff elapses). The tick loop's `_sweep_retries` claims rows whose
+  `not_before <= now`. A retry mid-backoff survives a daemon restart — `_recover`
+  skips `RETRYING` rows and lets the sweep handle them.
+- **One row per attempt**, keyed `(job, scheduled_for, attempt)` — `history`
+  shows each attempt's own exit code / output. The failed row stays `FAILED`;
+  the retry is a *new* row, not a mutation.
+- Backoff math is `RetryPolicy.delay_for_attempt` (fixed / linear / exponential,
+  capped at `max_delay`), already in `models.py`.
+
+### O2b addendum — exit-code sentinel  *(built — M2 slice 1)*
+Every run is spawned through `python -m punctual._runner <run_dir> -- <argv>`.
+The wrapper runs the real command, forwards SIGTERM/SIGINT/SIGHUP to it, and on
+exit writes `<run_dir>/exit` (`{code, signaled, at}`, atomic rename) before
+returning that code. On restart, `_recover` reads the sentinel for a `RUNNING`
+row whose pid is gone and resolves the run to `SUCCEEDED` / `FAILED` /
+`TIMED_OUT` (signaled ⇒ treated as `TIMED_OUT`) instead of a blind `LOST`;
+`recovered_from_sentinel` is logged. `run_dir` is deleted once a run reaches a
+non-retryable terminal state. Cost: one lightweight Python process per run.
+
 ---
 
 ## Milestones
@@ -234,8 +260,14 @@ wedged" needs monotonic. NTP steps, laptop suspend, DST — enumerate the hazard
     operator logs. Not yet: the exit-code sentinel (would let a lost run resolve
     to its *real* outcome instead of LOST), true adopt-and-supervise.
   ⇒ **M1 done** modulo the sentinel + `plan`/`why` (M2).
-- **M2 — it's reliable**: retries + backoff + quarantine, timeouts done,
-  exit-code sentinel, `punctual plan` / `why`, `punctual drain` / `stop`.
+- **M2 — it's reliable**. Built in slices:
+  - *slice 1 ✅* — retries + backoff (O8), durable `RETRYING` rows swept by the
+    tick loop, exit-code sentinel (O2b addendum), `history` shows `#attempt`.
+  - *slice 2* — quarantine: consecutive-failure count → `QUARANTINED` stops the
+    job; fire the `on_fail` notification URI.
+  - *slice 3* — `punctual why <job>` + richer `plan` (retry/quarantine state,
+    why a fire was skipped/capped).
+  - *slice 4* — control socket → `punctual drain` / `stop --kill` / `reload`.
 - **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
