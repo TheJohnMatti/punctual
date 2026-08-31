@@ -32,15 +32,19 @@ uv run pre-commit install    # ruff + hygiene hooks on every commit
 
 ## Releasing
 
-Releases are tag-driven. `version` in `pyproject.toml` is the source of truth.
+Fully tag-driven — `hatch-vcs` derives the version from the tag, so there is no
+version to bump anywhere.
 
 ```console
-# bump version in pyproject.toml, commit via PR, then:
-git tag v0.0.1
-git push origin v0.0.1
+git tag v0.1.0        # -> package version 0.1.0
+git push origin v0.1.0
 ```
 
 The `release` workflow builds the sdist + wheel, publishes to PyPI via OIDC
-trusted publishing (no API token), and opens a GitHub Release. One-time PyPI
-setup: add a trusted publisher for `punctual-scheduler` pointing at this repo's
-`release.yml` / `pypi` environment.
+trusted publishing (no API token), and opens a GitHub Release. Between tags,
+local builds get a dev version like `0.1.dev7+g1a2b3c4`.
+
+One-time PyPI setup (not yet done): add a pending publisher at
+<https://pypi.org/manage/account/publishing/> — project `punctual-scheduler`,
+owner `TheJohnMatti`, repo `punctual`, workflow `release.yml`, environment
+`pypi`.
