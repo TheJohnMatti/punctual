@@ -1,0 +1,8 @@
+name: punctual CodeQL config
+
+query-filters:
+  # `...` in a typing.Protocol / stub body is the idiomatic form, not a bug.
+  # ruff's B018 already flags genuinely useless expressions (and correctly
+  # ignores `...` and docstrings).
+  - exclude:
+      id: py/ineffectual-statement

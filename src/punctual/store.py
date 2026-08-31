@@ -123,11 +123,15 @@ class Store(Protocol):
         self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
     ) -> Run | None:
         """Create the next attempt's row (state RETRYING, due at not_before)."""
-        ...
 
-    def due_retries(self, now: datetime) -> list[Run]: ...
-    def next_retry_at(self) -> datetime | None: ...
-    def run_dir(self, run_id: int) -> Path: ...
+    def due_retries(self, now: datetime) -> list[Run]:
+        """RETRYING rows whose not_before has passed, oldest first."""
+
+    def next_retry_at(self) -> datetime | None:
+        """Earliest not_before across all RETRYING rows."""
+
+    def run_dir(self, run_id: int) -> Path:
+        """Per-run scratch dir path (holds the exit sentinel)."""
 
 
 class SqliteStore:
