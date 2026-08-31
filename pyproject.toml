@@ -2,7 +2,7 @@
 # dead 2019 dotfile manager); the import package and the CLI are both `punctual`.
 [project]
 name = "punctual-scheduler"
-version = "0.0.0"
+dynamic = ["version"]  # derived from the git tag by hatch-vcs
 description = "The reliability layer cron never had: retries, catch-up, dependencies, observability, exactly-once. One process, zero infra."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,8 +46,13 @@ Source = "https://github.com/TheJohnMatti/punctual"
 Issues = "https://github.com/TheJohnMatti/punctual/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"  # version = the current git tag (e.g. v0.1.2 -> 0.1.2).
+# No version-file hook: runtime __version__ comes from importlib.metadata, so
+# there's nothing generated to gitignore or lint.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/punctual"]
