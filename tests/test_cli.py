@@ -129,3 +129,11 @@ def test_plan_annotates_quarantined(tmp_path, monkeypatch):
     r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "plan", "--hours", "1"])
     assert r.exit_code == 0
     assert "quarantined" in r.output
+
+
+def test_control_commands_report_no_daemon(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUNCTUAL_SOCKET", "/tmp/pnc-cli-test.sock")
+    for cmd in ("ping", "metrics", "healthz", "reload", "drain"):
+        r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), cmd])
+        assert r.exit_code != 0
+        assert "no daemon" in r.output

@@ -12,11 +12,23 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from punctual.models import JobState, Run, RunState
+
+
+@dataclass(slots=True)
+class MetricsSnapshot:
+    """Aggregates for `punctual metrics` / `/metrics` (M3), computed in one pass."""
+
+    run_counts: dict[tuple[str, str], int] = field(default_factory=dict)  # (job, state) -> n
+    last_success: dict[str, datetime] = field(default_factory=dict)  # job -> newest success
+    durations: list[tuple[str, float]] = field(default_factory=list)  # (job, seconds), terminal
+    pending_retries: int = 0
+
 
 # Bump when SCHEMA changes; add the matching step to _migrate().
 SCHEMA_VERSION = 4
@@ -134,6 +146,7 @@ class Store(Protocol):
     def get_run(self, run_id: int) -> Run | None: ...
     def attempts_for(self, job: str, scheduled_for: datetime) -> list[Run]: ...
     def pending_retry(self, job: str) -> Run | None: ...
+    def metrics_snapshot(self) -> MetricsSnapshot: ...
 
     def job_state(self, job: str) -> JobState:
         """The per-job state row (defaults if the job has no row yet)."""
@@ -305,6 +318,28 @@ class SqliteStore:
             (job,),
         ).fetchone()
         return self._row_to_run(row) if row else None
+
+    def metrics_snapshot(self) -> MetricsSnapshot:
+        snap = MetricsSnapshot()
+        for r in self._db.execute(
+            "SELECT job, state, COUNT(*) n FROM runs WHERE finished_at IS NOT NULL "
+            "GROUP BY job, state"
+        ):
+            snap.run_counts[(r["job"], r["state"])] = r["n"]
+        for r in self._db.execute(
+            "SELECT job, MAX(finished_at) t FROM runs WHERE state='succeeded' GROUP BY job"
+        ):
+            if r["t"]:
+                snap.last_success[r["job"]] = _parse_req(r["t"])
+        for r in self._db.execute(
+            "SELECT job, started_at, finished_at FROM runs "
+            "WHERE started_at IS NOT NULL AND finished_at IS NOT NULL"
+        ):
+            secs = (_parse_req(r["finished_at"]) - _parse_req(r["started_at"])).total_seconds()
+            snap.durations.append((r["job"], max(0.0, secs)))
+        row = self._db.execute("SELECT COUNT(*) n FROM runs WHERE state='retrying'").fetchone()
+        snap.pending_retries = row["n"]
+        return snap
 
     # --- retries (M2) ---------------------------------------------------
     def schedule_retry(

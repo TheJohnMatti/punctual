@@ -14,7 +14,15 @@ from typing import Any
 
 from croniter import croniter
 
-from punctual.models import Backoff, Job, MissedPolicy, OnLost, RetryPolicy
+from punctual.models import (
+    Backoff,
+    Config,
+    Job,
+    MissedPolicy,
+    ObservabilityConfig,
+    OnLost,
+    RetryPolicy,
+)
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -34,6 +42,7 @@ _JOB_KEYS = {
     "quarantine_cooldown",
     "on_fail",
     "on_quarantine",
+    "on_recovery",
     "workdir",
     "env",
     "enabled",
@@ -120,6 +129,7 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
         quarantine_after=int(raw.get("quarantine_after", 5)),
         on_fail=raw.get("on_fail"),
         on_quarantine=raw.get("on_quarantine"),
+        on_recovery=raw.get("on_recovery"),
         workdir=raw.get("workdir"),
         env={str(k): str(v) for k, v in raw.get("env", {}).items()},
         enabled=bool(raw.get("enabled", True)),
@@ -145,7 +155,25 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
     return job
 
 
-def load_config(path: str | Path) -> list[Job]:
+_OBSERVABILITY_KEYS = {"metrics_addr", "metrics_port"}
+
+
+def _observability(raw: dict[str, Any]) -> ObservabilityConfig:
+    unknown = set(raw) - _OBSERVABILITY_KEYS
+    if unknown:
+        raise ConfigError(f"[observability]: unknown keys {sorted(unknown)}")
+    cfg = ObservabilityConfig()
+    if "metrics_addr" in raw:
+        cfg.metrics_addr = str(raw["metrics_addr"])
+    if "metrics_port" in raw:
+        port = int(raw["metrics_port"])
+        if not 1 <= port <= 65535:
+            raise ConfigError(f"[observability]: metrics_port {port} out of range")
+        cfg.metrics_port = port
+    return cfg
+
+
+def load_config(path: str | Path) -> Config:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"{path} not found")
@@ -153,6 +181,10 @@ def load_config(path: str | Path) -> list[Job]:
         doc = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}") from e
+
+    unknown_top = set(doc) - {"job", "observability"}
+    if unknown_top:
+        raise ConfigError(f"{path}: unknown top-level table(s) {sorted(unknown_top)}")
 
     jobs_table = doc.get("job", {})
     if not jobs_table:
@@ -166,4 +198,4 @@ def load_config(path: str | Path) -> list[Job]:
             if dep not in names:
                 raise ConfigError(f"job {j.name!r}: after references unknown job {dep!r}")
     # DESIGN O1: also reject dependency cycles here once M4 lands.
-    return jobs
+    return Config(jobs=jobs, observability=_observability(doc.get("observability", {})))

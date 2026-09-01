@@ -18,7 +18,7 @@ import click
 
 from punctual import __version__, introspect
 from punctual.config import ConfigError, load_config
-from punctual.models import Job, RunState
+from punctual.models import Config, Job, RunState
 from punctual.schedule import fires_between
 from punctual.scheduler import serve
 from punctual.store import SqliteStore
@@ -34,11 +34,15 @@ _STATE_COLOUR = {
 }
 
 
-def _load(ctx: click.Context) -> list[Job]:
+def _load_config(ctx: click.Context) -> Config:
     try:
         return load_config(ctx.obj["config_path"])
     except ConfigError as e:
         raise click.ClickException(str(e)) from e
+
+
+def _load(ctx: click.Context) -> list[Job]:
+    return _load_config(ctx).jobs
 
 
 def _instance_id() -> str:
@@ -215,12 +219,23 @@ def run(ctx: click.Context, verbose: bool) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
     path = ctx.obj["config_path"]
-    jobs = _load(ctx)
+    cfg = _load_config(ctx)
     store = SqliteStore()
-    n = sum(1 for j in jobs if j.enabled)
-    click.secho(f"punctual: {n} job(s) armed · state at {store.path}", fg="green")
+    n = sum(1 for j in cfg.jobs if j.enabled)
+    where = (
+        f" · metrics :{cfg.observability.metrics_port}" if cfg.observability.metrics_port else ""
+    )
+    click.secho(f"punctual: {n} job(s) armed · state at {store.path}{where}", fg="green")
     try:
-        asyncio.run(serve(jobs, store, _instance_id(), config_reload=lambda: load_config(path)))
+        asyncio.run(
+            serve(
+                cfg.jobs,
+                store,
+                _instance_id(),
+                config_reload=lambda: load_config(path).jobs,
+                observability=cfg.observability,
+            )
+        )
     finally:
         store.close()
     click.echo("punctual: stopped")
@@ -242,6 +257,21 @@ def ping() -> None:
     click.echo(
         f"pid {r['pid']}, {r['jobs']} job(s), {r['in_flight']} in flight, up {r['uptime_s']}s"
     )
+
+
+@main.command()
+def metrics() -> None:
+    """Print the running daemon's Prometheus metrics."""
+    click.echo(_talk("metrics")["text"], nl=False)
+
+
+@main.command()
+def healthz() -> None:
+    """Exit 0 if the scheduler loop is live, non-zero otherwise."""
+    r = _talk("healthz")
+    click.echo(r["reason"])
+    if not r["ok"]:
+        raise SystemExit(1)
 
 
 @main.command()
