@@ -205,10 +205,30 @@ it is a no-op on a fresh DB). No migration framework, no down-migrations. A
 column *rename* or *type change* will need a table rebuild — cross that bridge
 when we reach it. Pre-alpha DBs with no `user_version` are treated as v0.
 
-### O6 — Observability surface
-Prometheus text endpoint (`punctual metrics` / a port), OTel spans per run,
-structured JSON logs. Which are in the MVP vs later? A `/healthz` that means
-"scheduler loop is live AND not wedged".
+### O6 — Observability surface  *(metrics + health built — M3 slice 1)*
+- **Metrics are hand-rolled** (`punctual/metrics.py`) — no `prometheus_client`
+  (D7). Most are *derived from the store* on each scrape (`store.metrics_snapshot`
+  is one pass), not counters incremented in-process, so a client library barely
+  fits. Emitted: `punctual_runs_total{job,state}`,
+  `punctual_time_since_last_success_seconds{job}` (the SLO signal),
+  `punctual_run_duration_seconds` histogram, `punctual_lost_runs_total{job}`,
+  `punctual_job_quarantined{job}`, `punctual_job_consecutive_failures{job}`,
+  `punctual_pending_retries`, `punctual_scheduler_loop_lag_seconds`.
+- **Exposed** by `punctual metrics` over the control socket, and — opt-in via
+  `[observability] metrics_port` (+ `metrics_addr`, default `127.0.0.1`) — a
+  minimal stdlib HTTP listener serving `GET /metrics` and `GET /healthz`.
+- **`/healthz`** = `200 ok` unless draining, or the tick loop hasn't run for
+  `> MAX_SLEEP + 5s` (→ `503`). `punctual healthz` exits non-zero on unhealthy.
+- Config gained a **`Config` object** (`load_config -> Config` with `.jobs` +
+  `.observability`); top-level tables other than `[job.*]` / `[observability]`
+  are now a hard error.
+- **Structured JSON logs**, **OTel spans**, `punctual tui` — later M3 slices /
+  optional extras.
+
+### O10 addendum — `on_recovery`  *(built — M3 slice 1)*
+A third notify hook: fires when a job that was quarantined or had a non-zero
+`consecutive_failures` succeeds again. Same sinks / fire-and-forget as
+`on_fail` / `on_quarantine`.
 
 ### O7 — Time: monotonic vs wall
 Scheduling is wall-clock (cron semantics), but drift detection / "is the loop
@@ -333,7 +353,14 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
   - *slice 4 ✅* — control socket (O11): UDS + newline-JSON;
     `punctual ping` / `drain` / `stop [--kill]` / `reload` (add/remove jobs
     live, changed jobs need a restart). **⇒ M2 done.**
-- **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
+- **M3 — it's observable**. Built in slices:
+  - *slice 1 ✅* — hand-rolled Prometheus metrics + `/metrics` + `/healthz`
+    (O6), `punctual metrics` / `healthz`, loop-lag, `Config` object,
+    `on_recovery` hook (O10 addendum).
+  - *slice 2* — structured JSON logs (`punctual run --log-format json`).
+  - *slice 3* — `punctual tui` (Textual, optional extra `[tui]`).
+  - *slice 4* — notification plugin surface (entry-point sinks: `ntfy://`, …).
+  - OTel spans + `TRACEPARENT` injection — optional extra `[otel]`, post-M3.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
 - **M6 — durable steps**: `@punctual.step` in-process checkpointing.

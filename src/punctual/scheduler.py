@@ -19,8 +19,9 @@ Shutdown: the first SIGINT/SIGTERM is a **drain** — stop claiming, let in-flig
 runs finish, exit. A second signal is **stop --kill** — SIGKILL every in-flight
 job's process group; those runs land FAILED.
 
-Deliberately *not* here yet: `punctual why` (M2 slice 3), the control socket for
-`punctual drain` / `stop` / `reload` (M2 slice 4).
+The control socket (`punctual/control.py`) exposes drain / stop / reload / ping /
+metrics / healthz. With `[observability] metrics_port` set, `/metrics` and
+`/healthz` are also served over HTTP (M3).
 """
 
 from __future__ import annotations
@@ -30,13 +31,14 @@ import contextlib
 import logging
 import shutil
 import signal
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from punctual import notify
+from punctual import metrics, notify
 from punctual.control import ControlServer
 from punctual.executor import Sentinel, execute, kill_group, read_sentinel
 from punctual.models import (
@@ -46,6 +48,7 @@ from punctual.models import (
     Job,
     JobState,
     MissedPolicy,
+    ObservabilityConfig,
     OnLost,
     Run,
     RunState,
@@ -69,6 +72,7 @@ class Scheduler:
     handle_signals: bool = True  # tests set False; the CLI leaves it on
     control: bool = False  # control socket (M2 slice 4) — `serve()` turns it on
     config_reload: Callable[[], list[Job]] | None = None  # re-parse punctual.toml
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake: asyncio.Event = field(default_factory=asyncio.Event, init=False)
@@ -76,15 +80,18 @@ class Scheduler:
     _since: dict[str, datetime] = field(default_factory=dict, init=False)
     _running: dict[int, Run] = field(default_factory=dict, init=False)  # run id -> Run
     _started: datetime = field(default_factory=lambda: datetime.now(UTC), init=False)
+    _last_tick: float = field(default_factory=time.monotonic, init=False)  # monotonic
+    _loop_lag: float = 0.0
 
     async def run(self) -> None:
         self._install_signal_handlers()
         try:
             self._started = datetime.now(UTC)
+            self._last_tick = time.monotonic()
             for job in self.jobs:
                 self._since.setdefault(job.name, self._started)
 
-            async with self._control_server(), asyncio.TaskGroup() as tg:
+            async with self._control_server(), self._metrics_http(), asyncio.TaskGroup() as tg:
                 self._recover(tg)
                 for job in self._enabled():
                     fires = self._plan_catch_up(job)
@@ -94,6 +101,7 @@ class Scheduler:
                 while not self._stopping.is_set():
                     self._dispatch_due(tg)
                     self._sweep_retries(tg)
+                    self._last_tick = time.monotonic()
                     await self._sleep(self._time_to_next())
             # exiting the TaskGroup waits for in-flight runs to finish (drain)
             await notify.drain()
@@ -104,6 +112,26 @@ class Scheduler:
         if not self.control:
             return contextlib.nullcontext()
         return ControlServer(self)
+
+    def _metrics_http(self) -> AbstractAsyncContextManager[object]:
+        port = self.observability.metrics_port
+        if port is None:
+            return contextlib.nullcontext()
+        return metrics.http_server(
+            self.observability.metrics_addr, port, self.metrics_text, self.healthz
+        )
+
+    # --- observability (M3) ----------------------------------------
+    def metrics_text(self) -> str:
+        return metrics.render(self.store, self.jobs, loop_lag=self._loop_lag)
+
+    def healthz(self) -> tuple[bool, str]:
+        if self._stopping.is_set():
+            return False, "draining"
+        stale = time.monotonic() - self._last_tick
+        if stale > MAX_SLEEP + 5:
+            return False, f"scheduler loop stalled — no tick for {stale:.0f}s"
+        return True, "ok"
 
     # --- driven from the control socket / signals --------------------
     def request_drain(self) -> None:
@@ -362,9 +390,13 @@ class Scheduler:
         return max(0.0, (min(candidates) - now).total_seconds())
 
     async def _sleep(self, seconds: float) -> None:
+        cap = min(seconds, MAX_SLEEP)
+        t0 = time.monotonic()
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._wake.wait(), timeout=min(seconds, MAX_SLEEP))
+            await asyncio.wait_for(self._wake.wait(), timeout=cap)
         self._wake.clear()
+        # an early wake is a signal, not lag; only overshoot past the cap counts
+        self._loop_lag = max(0.0, time.monotonic() - t0 - cap)
 
     # --- retries (M2) ----------------------------------------------
     def _sweep_retries(self, tg: asyncio.TaskGroup) -> None:
@@ -446,9 +478,12 @@ class Scheduler:
             )
             self._clear_quarantine(state)
             self.store.save_job_state(state)
+            self._notify(job.on_recovery, "recovery", job, run, state, outcome)
         elif state.consecutive_failures:
+            log.info("%s: recovered after %d failed fire(s)", job.name, state.consecutive_failures)
             state.consecutive_failures = 0
             self.store.save_job_state(state)
+            self._notify(job.on_recovery, "recovery", job, run, state, outcome)
 
     @staticmethod
     def _clear_quarantine(state: JobState) -> None:
@@ -551,6 +586,7 @@ async def serve(
     instance_id: str,
     *,
     config_reload: Callable[[], list[Job]] | None = None,
+    observability: ObservabilityConfig | None = None,
 ) -> None:
     await Scheduler(
         jobs=jobs,
@@ -558,4 +594,5 @@ async def serve(
         instance_id=instance_id,
         control=True,
         config_reload=config_reload,
+        observability=observability or ObservabilityConfig(),
     ).run()

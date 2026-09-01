@@ -34,6 +34,8 @@ class Controllable(Protocol):
     def in_flight(self) -> int: ...
     def control_status(self) -> dict[str, object]: ...
     def reload(self) -> dict[str, object]: ...
+    def metrics_text(self) -> str: ...
+    def healthz(self) -> tuple[bool, str]: ...
 
 
 def socket_path() -> Path:
@@ -104,6 +106,11 @@ class ControlServer:
             return {"ok": True, "killed": bool(req.get("kill"))}
         if cmd == "reload":
             return {"ok": True, **s.reload()}
+        if cmd == "metrics":
+            return {"ok": True, "text": s.metrics_text()}
+        if cmd == "healthz":
+            ok, reason = s.healthz()
+            return {"ok": ok, "reason": reason}
         return {"ok": False, "error": f"unknown command {cmd!r}"}
 
 
@@ -115,8 +122,8 @@ class NotRunning(RuntimeError):
 async def _request(payload: dict[str, Any], path: Path, timeout: float) -> dict[str, Any]:
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout=2)
-    except (FileNotFoundError, ConnectionRefusedError) as e:
-        raise NotRunning(f"no daemon listening at {path}") from e
+    except (OSError, TimeoutError) as e:
+        raise NotRunning(f"no daemon listening at {path} ({e})") from e
     try:
         writer.write(json.dumps(payload).encode() + b"\n")
         await writer.drain()

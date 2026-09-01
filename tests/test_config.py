@@ -22,7 +22,7 @@ def test_minimal_job(tmp_path):
         command = "restic backup /data"
     """,
     )
-    (job,) = load_config(cfg)
+    (job,) = load_config(cfg).jobs
     assert job.name == "backup"
     assert job.command == ["restic", "backup", "/data"]
     assert job.missed is MissedPolicy.RUN_LATEST
@@ -48,7 +48,7 @@ def test_full_job(tmp_path):
         on_missed = "skip"
     """,
     )
-    jobs = {j.name: j for j in load_config(cfg)}
+    jobs = {j.name: j for j in load_config(cfg).jobs}
     r = jobs["retrain"]
     assert r.timezone == "America/Toronto"
     assert r.timeout == timedelta(minutes=45)
@@ -79,7 +79,7 @@ def test_on_lost_defaults_derive_from_idempotent(tmp_path):
         on_lost = "fail"
     """,
     )
-    jobs = {j.name: j for j in load_config(cfg)}
+    jobs = {j.name: j for j in load_config(cfg).jobs}
     assert jobs["plain"].idempotent is False
     assert jobs["plain"].on_lost is None
     assert jobs["plain"].effective_on_lost is OnLost.FAIL
@@ -113,8 +113,36 @@ def test_rejections(tmp_path, body, msg):
 
 def test_shorthand_schedule(tmp_path):
     cfg = write(tmp_path, "[job.x]\nschedule='@hourly'\ncommand='true'")
-    (job,) = load_config(cfg)
+    (job,) = load_config(cfg).jobs
     assert job.schedule == "@hourly"  # normalized at schedule-computation time, not load
+
+
+def test_observability_section(tmp_path):
+    cfg = write(
+        tmp_path,
+        """
+        [observability]
+        metrics_port = 9095
+
+        [job.x]
+        schedule = "@hourly"
+        command = "true"
+        """,
+    )
+    obs = load_config(cfg).observability
+    assert obs.metrics_port == 9095 and obs.metrics_addr == "127.0.0.1"
+
+
+def test_observability_rejects_junk(tmp_path):
+    cfg = write(tmp_path, "[observability]\nnope = 1\n[job.x]\nschedule='@hourly'\ncommand='true'")
+    with pytest.raises(ConfigError, match="unknown keys"):
+        load_config(cfg)
+
+
+def test_unknown_top_level_table_is_rejected(tmp_path):
+    cfg = write(tmp_path, "[nonsense]\nx = 1\n[job.x]\nschedule='@hourly'\ncommand='true'")
+    with pytest.raises(ConfigError, match="unknown top-level"):
+        load_config(cfg)
 
 
 @pytest.mark.parametrize(

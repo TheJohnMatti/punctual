@@ -125,6 +125,32 @@ async def test_cooldown_probe_recovers_a_healthy_job(tmp_path):
     store.close()
 
 
+async def test_on_recovery_notification_fires(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    hook = tmp_path / "recovered.json"
+    script = tmp_path / "sink.py"
+    script.write_text("import sys, pathlib\npathlib.Path(sys.argv[1]).write_text(sys.stdin.read())")
+    marker = tmp_path / "ok"
+    job = _job(
+        "j",
+        _gated(marker),
+        quarantine_after=99,
+        on_recovery=f"exec:{sys.executable} {script} {hook}",
+    )
+    sched = Scheduler([job], store, "t", handle_signals=False)
+
+    task = asyncio.create_task(sched.run())
+    await asyncio.sleep(2.0)  # a few failed fires
+    marker.write_text("")  # now it succeeds
+    await asyncio.sleep(2.0)
+    sched._request_stop()
+    await asyncio.wait_for(task, timeout=10)
+
+    assert hook.exists()
+    assert json.loads(hook.read_text())["event"] == "recovery"
+    store.close()
+
+
 async def test_on_quarantine_notification_fires(tmp_path):
     store = SqliteStore(tmp_path / "s.db")
     hook = tmp_path / "paged.json"

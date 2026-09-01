@@ -1,5 +1,8 @@
 # Example config. `punctual validate -c examples/punctual.toml` to check it.
 
+[observability]
+metrics_port = 9095          # serve GET /metrics + /healthz on 127.0.0.1:9095
+
 [job.scrape]
 schedule  = "*/10 * * * *"
 command   = "python -m sniper.scrape"

@@ -99,6 +99,17 @@ async def test_reload_adds_and_removes_jobs(sock, tmp_path):
     store.close()
 
 
+async def test_metrics_and_healthz_over_the_socket(sock, tmp_path):
+    store = SqliteStore(tmp_path / "d.db")
+    sched, task = await _serve([_job("a")], store)
+    m = await _call("metrics")
+    assert m["ok"] and "punctual_up 1" in m["text"]
+    h = await _call("healthz")
+    assert h["ok"] and h["reason"] == "ok"
+    await _shutdown(sched, task)
+    store.close()
+
+
 def test_client_raises_when_no_daemon(sock):
     with pytest.raises(control.NotRunning):
         control.request("ping", timeout=1)

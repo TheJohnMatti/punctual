@@ -51,8 +51,14 @@ $ punctual why retrain 412     # explain one run: trigger, attempts, what happen
 $ punctual resume retrain      # take a job out of quarantine
 $ punctual reload              # apply added / removed jobs without a restart
 $ punctual stop --kill         # drain (or hard-kill) the running daemon
+$ punctual metrics             # Prometheus text; also GET /metrics if a port is set
 $ punctual tui                 # live dashboard                          (coming, M3)
 ```
+
+Set `[observability] metrics_port = 9095` in `punctual.toml` and the daemon
+serves `GET /metrics` (per-job counters, run-duration histogram,
+`punctual_time_since_last_success_seconds` — the SLO gauge) and `GET /healthz`
+on `127.0.0.1:9095`.
 
 ## Quickstart
 
@@ -80,11 +86,12 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2):** scheduling, subprocess exec with output
-> capture + timeouts, durable history, restart recovery + catch-up, retries with
-> backoff, a quarantine circuit-breaker + failure notifications, `why` /
-> `status` / annotated `plan`, and a control socket (`drain` / `stop` /
-> `reload`). **Not yet:** a metrics endpoint, a TUI, job dependencies. See
+> **What works today (M1 + M2 + M3 slice 1):** scheduling, subprocess exec with
+> output capture + timeouts, durable history, restart recovery + catch-up,
+> retries with backoff, a quarantine circuit-breaker + failure/recovery
+> notifications, `why` / `status` / annotated `plan`, a control socket (`drain` /
+> `stop` / `reload`), and Prometheus `/metrics` + `/healthz`. **Not yet:**
+> structured JSON logs, a TUI, job dependencies. See
 > [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles

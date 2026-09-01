@@ -131,6 +131,7 @@ class Job:
     quarantine_cooldown: timedelta | None = None  # let one probe fire through after this
     on_fail: str | None = None  # notify URI: a fire exhausted its retries
     on_quarantine: str | None = None  # notify URI: the job was quarantined
+    on_recovery: str | None = None  # notify URI: a failing job is healthy again
     workdir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
@@ -141,6 +142,22 @@ class Job:
         if self.on_lost is not None:
             return self.on_lost
         return OnLost.RETRY if self.idempotent else OnLost.FAIL
+
+
+@dataclass(slots=True)
+class ObservabilityConfig:
+    """The optional ``[observability]`` table in punctual.toml (M3)."""
+
+    metrics_addr: str = "127.0.0.1"
+    metrics_port: int | None = None  # None -> no HTTP listener
+
+
+@dataclass(slots=True)
+class Config:
+    """Everything parsed from punctual.toml."""
+
+    jobs: list[Job]
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
 
 @dataclass(slots=True)
