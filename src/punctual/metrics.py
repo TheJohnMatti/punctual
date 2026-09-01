@@ -127,7 +127,7 @@ async def http_server(
             )
             await writer.drain()
         except (TimeoutError, ConnectionError, UnicodeDecodeError):
-            pass
+            pass  # a slow / broken / garbage client is not our problem — just drop it
         finally:
             writer.close()
 
