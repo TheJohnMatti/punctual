@@ -131,6 +131,9 @@ class Store(Protocol):
     def last_fire(self, job: str) -> datetime | None: ...
     def set_last_fire(self, job: str, when: datetime) -> None: ...
     def history(self, job: str | None = None, limit: int = 50) -> list[Run]: ...
+    def get_run(self, run_id: int) -> Run | None: ...
+    def attempts_for(self, job: str, scheduled_for: datetime) -> list[Run]: ...
+    def pending_retry(self, job: str) -> Run | None: ...
 
     def job_state(self, job: str) -> JobState:
         """The per-job state row (defaults if the job has no row yet)."""
@@ -284,6 +287,25 @@ class SqliteStore:
             ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
+    def get_run(self, run_id: int) -> Run | None:
+        row = self._db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def attempts_for(self, job: str, scheduled_for: datetime) -> list[Run]:
+        """Every attempt row for one fire, oldest attempt first."""
+        rows = self._db.execute(
+            "SELECT * FROM runs WHERE job=? AND scheduled_for=? ORDER BY attempt",
+            (job, _utc(scheduled_for)),
+        ).fetchall()
+        return [self._row_to_run(r) for r in rows]
+
+    def pending_retry(self, job: str) -> Run | None:
+        row = self._db.execute(
+            "SELECT * FROM runs WHERE job=? AND state='retrying' ORDER BY not_before LIMIT 1",
+            (job,),
+        ).fetchone()
+        return self._row_to_run(row) if row else None
+
     # --- retries (M2) ---------------------------------------------------
     def schedule_retry(
         self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
@@ -339,4 +361,5 @@ class SqliteStore:
             stdout_tail=r["stdout_tail"],
             stderr_tail=r["stderr_tail"],
             not_before=_parse(r["not_before"]),
+            created_at=_parse(r["created_at"]),
         )

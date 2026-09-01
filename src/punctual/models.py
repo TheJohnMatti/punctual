@@ -185,6 +185,7 @@ class Run:
     stdout_tail: str | None = None  # last O5.TAIL_BYTES of stdout, decoded
     stderr_tail: str | None = None  # last O5.TAIL_BYTES of stderr, decoded
     not_before: datetime | None = None  # M2: a RETRYING row is due at/after this
+    created_at: datetime | None = None  # when the row was claimed (for `why`)
 
     @property
     def duration(self) -> timedelta | None:

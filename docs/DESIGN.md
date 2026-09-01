@@ -305,8 +305,12 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
     `QUARANTINED` skips the job; `punctual resume` + opt-in `quarantine_cooldown`
     probe; `punctual status`. Notifications (O10): `on_fail` / `on_quarantine`
     hooks, `exec:` + `http(s):` sinks.
-  - *slice 3* — `punctual why <job>` + richer `plan` (retry/quarantine state,
-    why a fire was skipped/capped).
+  - *slice 3 ✅* — `punctual/introspect.py`: `why <job>` (health, quarantine,
+    last run, pending retry, next fire) and `why <job> <run-id>` (trigger, prior
+    attempts, what-happened-next, output tail). `--json` on `why` / `status`.
+    `plan` annotates each fire (retry / quarantined-collapsed) + a catch-up
+    preview; `-n/--limit` caps output (a per-2s job over 24h is 43k fires).
+    Read-only, DB + config, no daemon needed. `Run.created_at` surfaced.
   - *slice 4* — control socket → `punctual drain` / `stop --kill` / `reload`.
 - **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
