@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-import logging
 import os
 import socket
 from collections.abc import Callable
@@ -210,14 +209,19 @@ def _render_run(r: dict[str, Any]) -> None:
 
 @main.command()
 @click.option("-v", "--verbose", is_flag=True, help="DEBUG-level logs")
+@click.option(
+    "--log-format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="json = one event object per line",
+)
 @click.pass_context
-def run(ctx: click.Context, verbose: bool) -> None:
+def run(ctx: click.Context, verbose: bool, log_format: str) -> None:
     """Start the scheduler daemon (run this under systemd / launchd)."""
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
+    from punctual import logs
+
+    logs.configure(log_format, verbose=verbose)
     path = ctx.obj["config_path"]
     cfg = _load_config(ctx)
     store = SqliteStore()

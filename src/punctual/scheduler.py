@@ -177,7 +177,13 @@ class Scheduler:
         for n in removed:
             self._since.pop(n, None)
         self._wake.set()
-        log.info("reload: added=%s removed=%s changed=%s", added, removed, changed)
+        log.info(
+            "reload: added=%s removed=%s changed=%s",
+            added,
+            removed,
+            changed,
+            extra={"event": "reload", "added": added, "removed": removed, "changed": changed},
+        )
         note = "changed jobs keep their old definition — restart to apply" if changed else ""
         return {"added": added, "removed": removed, "changed": changed, "note": note}
 
@@ -273,6 +279,7 @@ class Scheduler:
             run.job,
             run.scheduled_for.isoformat(timespec="minutes"),
             note,
+            extra={"event": "run_lost", "job": run.job, "run_id": run.id, "note": note},
         )
 
     # --- catch-up (O3) -------------------------------------------------
@@ -467,6 +474,11 @@ class Scheduler:
                     job.name,
                     state.quarantine_reason,
                     job.name,
+                    extra={
+                        "event": "quarantined",
+                        "job": job.name,
+                        "reason": state.quarantine_reason,
+                    },
                 )
                 self._notify(job.on_quarantine, "quarantine", job, run, state, outcome)
             self.store.save_job_state(state)
@@ -475,12 +487,18 @@ class Scheduler:
                 "%s: recovered — quarantine cleared (%d fires had been skipped)",
                 job.name,
                 state.skipped_quarantined,
+                extra={"event": "recovered", "job": job.name, "was": "quarantined"},
             )
             self._clear_quarantine(state)
             self.store.save_job_state(state)
             self._notify(job.on_recovery, "recovery", job, run, state, outcome)
         elif state.consecutive_failures:
-            log.info("%s: recovered after %d failed fire(s)", job.name, state.consecutive_failures)
+            log.info(
+                "%s: recovered after %d failed fire(s)",
+                job.name,
+                state.consecutive_failures,
+                extra={"event": "recovered", "job": job.name, "was": "degraded"},
+            )
             state.consecutive_failures = 0
             self.store.save_job_state(state)
             self._notify(job.on_recovery, "recovery", job, run, state, outcome)
@@ -550,6 +568,25 @@ class Scheduler:
                 state = RunState.FAILED
             run.transition_to(state)
             self.store.mark(run)
+            dur = run.duration.total_seconds() if run.duration else None
+            log.log(
+                logging.WARNING if state in FAILURE_OUTCOMES else logging.INFO,
+                "%s run %s %s (exit %s, %.1fs)",
+                run.job,
+                run.id,
+                state.value,
+                run.exit_code,
+                dur or 0.0,
+                extra={
+                    "event": "run_finished",
+                    "job": run.job,
+                    "run_id": run.id,
+                    "attempt": run.attempt,
+                    "state": state.value,
+                    "exit_code": run.exit_code,
+                    "duration_s": dur,
+                },
+            )
             self._after_terminal(job, run, state)
         finally:
             self._inflight[job.name] -= 1

@@ -86,13 +86,13 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2 + M3 slice 1):** scheduling, subprocess exec with
-> output capture + timeouts, durable history, restart recovery + catch-up,
-> retries with backoff, a quarantine circuit-breaker + failure/recovery
+> **What works today (M1 + M2 + M3 through slice 2):** scheduling, subprocess
+> exec with output capture + timeouts, durable history, restart recovery +
+> catch-up, retries with backoff, a quarantine circuit-breaker + failure/recovery
 > notifications, `why` / `status` / annotated `plan`, a control socket (`drain` /
-> `stop` / `reload`), and Prometheus `/metrics` + `/healthz`. **Not yet:**
-> structured JSON logs, a TUI, job dependencies. See
-> [`docs/DESIGN.md`](docs/DESIGN.md).
+> `stop` / `reload`), Prometheus `/metrics` + `/healthz`, and structured JSON
+> logs (`--log-format json`). **Not yet:** a TUI, notification plugins, job
+> dependencies. See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 
