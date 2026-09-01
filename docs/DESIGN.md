@@ -357,7 +357,11 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
   - *slice 1 ✅* — hand-rolled Prometheus metrics + `/metrics` + `/healthz`
     (O6), `punctual metrics` / `healthz`, loop-lag, `Config` object,
     `on_recovery` hook (O10 addendum).
-  - *slice 2* — structured JSON logs (`punctual run --log-format json`).
+  - *slice 2 ✅* — structured JSON logs: `punctual run --log-format json` swaps
+    the root handler for `logs.JSONFormatter` (one object per line: `ts` /
+    `level` / `logger` / `msg` + any `extra=` fields). Key transitions carry
+    `event` + `job` / `run_id` / `state` / … : `run_finished`, `run_lost`,
+    `quarantined`, `recovered`, `reload`. `text` stays the default.
   - *slice 3* — `punctual tui` (Textual, optional extra `[tui]`).
   - *slice 4* — notification plugin surface (entry-point sinks: `ntfy://`, …).
   - OTel spans + `TRACEPARENT` injection — optional extra `[otel]`, post-M3.
