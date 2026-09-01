@@ -91,3 +91,41 @@ def test_status_and_resume_a_quarantined_job(tmp_path, monkeypatch):
 
     r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "resume", "nope"])
     assert r.exit_code != 0 and "no job named" in r.output
+
+
+def test_why_job_and_run(tmp_path, monkeypatch):
+    db = tmp_path / "p.db"
+    monkeypatch.setenv("PUNCTUAL_DB", str(db))
+    store = SqliteStore(db)
+    run = store.claim("hello", datetime.now(UTC).replace(microsecond=0), "test")
+    run.transition_to(RunState.RUNNING)
+    run.transition_to(RunState.FAILED)
+    run.exit_code = 2
+    store.mark(run)
+    store.close()
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "why", "hello"])
+    assert r.exit_code == 0
+    assert "health" in r.output and "failed" in r.output
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "why", "hello", str(run.id), "--json"])
+    assert r.exit_code == 0
+    import json as _j
+
+    assert _j.loads(r.output)["exit_code"] == 2
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "why", "hello", "999"])
+    assert r.exit_code != 0
+
+
+def test_plan_annotates_quarantined(tmp_path, monkeypatch):
+    db = tmp_path / "p.db"
+    monkeypatch.setenv("PUNCTUAL_DB", str(db))
+    store = SqliteStore(db)
+    store.save_job_state(
+        JobState(job="hello", quarantined_at=datetime.now(UTC), quarantine_reason="x")
+    )
+    store.close()
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "plan", "--hours", "1"])
+    assert r.exit_code == 0
+    assert "quarantined" in r.output
