@@ -261,6 +261,25 @@ state row, `models.JobState`).
   (restarting the cooldown).
 - `punctual status` shows per-job health / quarantine at a glance.
 
+### O11 — Control socket  *(built — M2 slice 4)*
+The daemon listens on a Unix domain socket — `$PUNCTUAL_SOCKET`, else
+`$XDG_RUNTIME_DIR/punctual-<uid>.sock` (created 0600 via umask, unlinked on
+exit). One line of JSON per request, one per reply (`punctual/control.py`).
+
+- `ping` → pid / job count / uptime / in-flight
+- `drain` → stop claiming, exit when idle (same as first SIGINT)
+- `stop {kill: bool}` → drain, and with `kill` SIGKILL the in-flight groups now
+- `reload` → re-read the config path the daemon was started with. **Adds new
+  `[job.*]` and drops removed ones only**; a changed field on an existing job is
+  *reported* (`changed`, `note: restart to apply`) but the old definition keeps
+  running — no half-applied schedule/retry changes. Bad config → `{ok: false}`,
+  daemon keeps running the old one.
+
+`punctual drain` / `stop [--kill] [--timeout]` / `reload` / `ping` are the
+client; `stop` polls `ping` until the socket goes away. `NotRunning` is raised
+when nothing is listening. `why` / `status` stay DB-only (slice 3) — the socket
+is additive, and the seam for a future `punctual web`.
+
 ### O10 — Notifications  *(started — M2 slice 2; full plugin surface is M3)*
 Two hooks, both `str | None` URIs on `Job`: **`on_fail`** fires each time a fire
 exhausts its retries; **`on_quarantine`** fires when the breaker opens.
@@ -311,7 +330,9 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
     `plan` annotates each fire (retry / quarantined-collapsed) + a catch-up
     preview; `-n/--limit` caps output (a per-2s job over 24h is 43k fires).
     Read-only, DB + config, no daemon needed. `Run.created_at` surfaced.
-  - *slice 4* — control socket → `punctual drain` / `stop --kill` / `reload`.
+  - *slice 4 ✅* — control socket (O11): UDS + newline-JSON;
+    `punctual ping` / `drain` / `stop [--kill]` / `reload` (add/remove jobs
+    live, changed jobs need a restart). **⇒ M2 done.**
 - **M3 — it's observable**: metrics, traces, structured logs, `punctual tui`.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.

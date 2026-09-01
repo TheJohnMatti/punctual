@@ -18,6 +18,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/punctual --config %h/.config/punctual/punctual.toml run
+# `systemctl --user reload punctual` applies added / removed jobs live.
+ExecReload=%h/.local/bin/punctual --config %h/.config/punctual/punctual.toml reload
 Restart=always
 RestartSec=2
 
@@ -26,10 +28,13 @@ RestartSec=2
 KillSignal=SIGINT
 TimeoutStopSec=300
 
+# The control socket lives here (falls back to $TMPDIR without this).
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
 # Light hardening — widen if your jobs need more.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=%h/.local/state/punctual
+ReadWritePaths=%h/.local/state/punctual /run/user/%U
 PrivateTmp=true
 
 [Install]
