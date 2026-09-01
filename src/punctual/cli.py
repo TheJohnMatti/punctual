@@ -83,10 +83,19 @@ def tui(ctx: click.Context) -> None:
 @click.pass_context
 def validate(ctx: click.Context) -> None:
     """Parse and check punctual.toml. Exit non-zero on any problem."""
+    from punctual import notify
+
     jobs = _load(ctx)
     for j in jobs:
         flag = "" if j.enabled else "  (disabled)"
         click.echo(f"  {j.name:20} {j.schedule:16} {' '.join(j.command)}{flag}")
+
+    uris = [u for j in jobs for u in (j.on_fail, j.on_quarantine, j.on_recovery)]
+    problems = notify.check(uris)
+    for uri, why in problems.items():
+        click.secho(f"  notify: {uri} — {why}", fg="yellow")
+    if problems:
+        raise click.ClickException(f"{len(problems)} unresolvable notification sink(s)")
     click.secho(f"ok — {len(jobs)} job(s)", fg="green")
 
 

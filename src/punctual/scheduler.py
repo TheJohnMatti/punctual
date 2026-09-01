@@ -90,6 +90,7 @@ class Scheduler:
             self._last_tick = time.monotonic()
             for job in self.jobs:
                 self._since.setdefault(job.name, self._started)
+            self._check_sinks()
 
             async with self._control_server(), self._metrics_http(), asyncio.TaskGroup() as tg:
                 self._recover(tg)
@@ -107,6 +108,12 @@ class Scheduler:
             await notify.drain()
         finally:
             self._remove_signal_handlers()
+
+    def _check_sinks(self) -> None:
+        notify.load_sinks()
+        uris = [u for j in self.jobs for u in (j.on_fail, j.on_quarantine, j.on_recovery)]
+        for uri, why in notify.check(uris).items():
+            log.warning("notify sink %r: %s — that hook is disabled", uri, why)
 
     def _control_server(self) -> AbstractAsyncContextManager[object]:
         if not self.control:
