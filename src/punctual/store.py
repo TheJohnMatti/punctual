@@ -16,10 +16,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from punctual.models import Run, RunState
+from punctual.models import JobState, Run, RunState
 
 # Bump when SCHEMA changes; add the matching step to _migrate().
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -45,11 +45,16 @@ CREATE INDEX IF NOT EXISTS runs_job_sched ON runs (job, scheduled_for);
 CREATE INDEX IF NOT EXISTS runs_open      ON runs (state) WHERE finished_at IS NULL;
 CREATE INDEX IF NOT EXISTS runs_retry     ON runs (not_before) WHERE state = 'retrying';
 
--- Last observed fire per job, so catch-up (DESIGN O3) has a baseline even across
--- a config change that renames or removes jobs.
+-- Per-job state that outlives any single run: the catch-up baseline (O3) and
+-- the quarantine circuit-breaker (M2 slice 2).
 CREATE TABLE IF NOT EXISTS job_clock (
-    job        TEXT PRIMARY KEY,
-    last_fire  TEXT NOT NULL
+    job                  TEXT PRIMARY KEY,
+    last_fire            TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    quarantined_at       TEXT,           -- NULL unless the job is quarantined
+    quarantine_reason    TEXT,
+    skipped_quarantined  INTEGER NOT NULL DEFAULT 0,  -- fires dropped while out
+    resume_requested     INTEGER NOT NULL DEFAULT 0   -- `punctual resume` sets this
 );
 """
 
@@ -62,6 +67,13 @@ _ADDED_COLUMNS = {
         "stdout_tail": "TEXT",
         "stderr_tail": "TEXT",
         "not_before": "TEXT",
+    },
+    "job_clock": {
+        "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+        "quarantined_at": "TEXT",
+        "quarantine_reason": "TEXT",
+        "skipped_quarantined": "INTEGER NOT NULL DEFAULT 0",
+        "resume_requested": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -119,6 +131,16 @@ class Store(Protocol):
     def last_fire(self, job: str) -> datetime | None: ...
     def set_last_fire(self, job: str, when: datetime) -> None: ...
     def history(self, job: str | None = None, limit: int = 50) -> list[Run]: ...
+
+    def job_state(self, job: str) -> JobState:
+        """The per-job state row (defaults if the job has no row yet)."""
+
+    def save_job_state(self, state: JobState) -> None:
+        """Persist everything on `state` except last_fire (see set_last_fire)."""
+
+    def request_resume(self, job: str) -> None:
+        """Flag the job to leave quarantine on the daemon's next tick."""
+
     def schedule_retry(
         self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
     ) -> Run | None:
@@ -202,6 +224,52 @@ class SqliteStore:
             "INSERT INTO job_clock (job, last_fire) VALUES (?,?) "
             "ON CONFLICT(job) DO UPDATE SET last_fire=excluded.last_fire",
             (job, _utc(when)),
+        )
+
+    # --- per-job state / quarantine (M2 slice 2) -----------------------
+    def job_state(self, job: str) -> JobState:
+        row = self._db.execute("SELECT * FROM job_clock WHERE job=?", (job,)).fetchone()
+        if row is None:
+            return JobState(job=job)
+        return JobState(
+            job=job,
+            last_fire=_parse(row["last_fire"]),
+            consecutive_failures=row["consecutive_failures"],
+            quarantined_at=_parse(row["quarantined_at"]),
+            quarantine_reason=row["quarantine_reason"],
+            skipped_quarantined=row["skipped_quarantined"],
+            resume_requested=bool(row["resume_requested"]),
+        )
+
+    def save_job_state(self, s: JobState) -> None:
+        self._db.execute(
+            "INSERT INTO job_clock "
+            "(job, last_fire, consecutive_failures, quarantined_at, quarantine_reason, "
+            " skipped_quarantined, resume_requested) "
+            "VALUES (?, COALESCE((SELECT last_fire FROM job_clock WHERE job=?), ?), ?,?,?,?,?) "
+            "ON CONFLICT(job) DO UPDATE SET "
+            "  consecutive_failures=excluded.consecutive_failures, "
+            "  quarantined_at=excluded.quarantined_at, "
+            "  quarantine_reason=excluded.quarantine_reason, "
+            "  skipped_quarantined=excluded.skipped_quarantined, "
+            "  resume_requested=excluded.resume_requested",
+            (
+                s.job,
+                s.job,
+                _utc(datetime.now(UTC)),
+                s.consecutive_failures,
+                _utc(s.quarantined_at) if s.quarantined_at else None,
+                s.quarantine_reason,
+                s.skipped_quarantined,
+                int(s.resume_requested),
+            ),
+        )
+
+    def request_resume(self, job: str) -> None:
+        self._db.execute(
+            "INSERT INTO job_clock (job, last_fire, resume_requested) VALUES (?,?,1) "
+            "ON CONFLICT(job) DO UPDATE SET resume_requested=1",
+            (job, _utc(datetime.now(UTC))),
         )
 
     def history(self, job: str | None = None, limit: int = 50) -> list[Run]:

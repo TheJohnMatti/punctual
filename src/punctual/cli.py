@@ -134,5 +134,67 @@ def history(ctx: click.Context, job: str | None, limit: int) -> None:
         click.echo(f"  {when}  {r.job:18} {att}  {state}  {dur}  exit {code}")
 
 
+@main.command()
+@click.pass_context
+def status(ctx: click.Context) -> None:
+    """One line per job: health and quarantine state."""
+    jobs = _load(ctx)
+    store = SqliteStore()
+    try:
+        for j in sorted(jobs, key=lambda x: x.name):
+            st = store.job_state(j.name)
+            if st.quarantined:
+                since = _ago(st.quarantined_at)
+                note = click.style(
+                    f"QUARANTINED  {st.quarantine_reason}; "
+                    f"{st.skipped_quarantined} fires skipped, since {since}",
+                    fg="red",
+                )
+            elif st.consecutive_failures:
+                note = click.style(
+                    f"degraded  {st.consecutive_failures} consecutive failures", fg="yellow"
+                )
+            elif not j.enabled:
+                note = click.style("disabled", fg="bright_black")
+            else:
+                last = f"last fire {_ago(st.last_fire)}" if st.last_fire else "no runs yet"
+                note = click.style(f"ok  {last}", fg="green")
+            click.echo(f"  {j.name:20}  {note}")
+    finally:
+        store.close()
+
+
+@main.command()
+@click.argument("job")
+@click.pass_context
+def resume(ctx: click.Context, job: str) -> None:
+    """Take a job out of quarantine (effective on the daemon's next tick)."""
+    names = {j.name for j in _load(ctx)}
+    if job not in names:
+        raise click.ClickException(f"no job named {job!r} in the config")
+    store = SqliteStore()
+    try:
+        st = store.job_state(job)
+        if not st.quarantined:
+            click.echo(f"{job} is not quarantined")
+            return
+        store.request_resume(job)
+    finally:
+        store.close()
+    click.secho(
+        f"{job}: resume requested — the daemon will clear quarantine on its next tick", fg="green"
+    )
+
+
+def _ago(when: dt.datetime | None) -> str:
+    if when is None:
+        return "never"
+    secs = (dt.datetime.now(dt.UTC) - when).total_seconds()
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit} ago"
+    return "just now"
+
+
 if __name__ == "__main__":
     main()
