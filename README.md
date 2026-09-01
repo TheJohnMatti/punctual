@@ -49,6 +49,8 @@ $ punctual history retrain     # every run: when, how long, exit code, output
 $ punctual why retrain         # health, last run, pending retry, next fire
 $ punctual why retrain 412     # explain one run: trigger, attempts, what happened next
 $ punctual resume retrain      # take a job out of quarantine
+$ punctual reload              # apply added / removed jobs without a restart
+$ punctual stop --kill         # drain (or hard-kill) the running daemon
 $ punctual tui                 # live dashboard                          (coming, M3)
 ```
 
@@ -78,11 +80,11 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2 through slice 3):** scheduling, subprocess exec
-> with output capture + timeouts, durable history, restart recovery + catch-up,
-> retries with backoff, a quarantine circuit-breaker + failure notifications,
-> and `why` / `status` / annotated `plan`. **Not yet:** `punctual drain`/`stop`
-> CLI verbs, a metrics endpoint, a TUI, job dependencies. See
+> **What works today (M1 + M2):** scheduling, subprocess exec with output
+> capture + timeouts, durable history, restart recovery + catch-up, retries with
+> backoff, a quarantine circuit-breaker + failure notifications, `why` /
+> `status` / annotated `plan`, and a control socket (`drain` / `stop` /
+> `reload`). **Not yet:** a metrics endpoint, a TUI, job dependencies. See
 > [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles

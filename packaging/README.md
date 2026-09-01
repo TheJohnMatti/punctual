@@ -5,6 +5,16 @@ alive and to restart it on crash. Both units below send a graceful stop signal
 that `punctual` treats as *drain*: stop claiming new fires, let in-flight jobs
 finish, then exit.
 
+Once it's running, talk to it over its control socket:
+
+```console
+punctual ping            # is it alive, how many jobs, how many in flight
+punctual reload          # apply added / removed jobs (changed jobs need a restart)
+punctual stop --kill     # drain, or hard-kill in-flight jobs and exit now
+```
+
+The systemd unit wires `systemctl --user reload punctual` to `punctual reload`.
+
 ## Linux — systemd (user service, no root)
 
 ```console

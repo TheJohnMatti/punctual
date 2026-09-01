@@ -31,6 +31,8 @@ import logging
 import shutil
 import signal
 from collections import defaultdict
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -64,21 +66,24 @@ class Scheduler:
     store: Store
     instance_id: str  # this daemon's identity (fencing token later)
     handle_signals: bool = True  # tests set False; the CLI leaves it on
+    control: bool = False  # control socket (M2 slice 4) — `serve()` turns it on
+    config_reload: Callable[[], list[Job]] | None = None  # re-parse punctual.toml
 
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _inflight: dict[str, int] = field(default_factory=lambda: defaultdict(int), init=False)
     _since: dict[str, datetime] = field(default_factory=dict, init=False)
     _running: dict[int, Run] = field(default_factory=dict, init=False)  # run id -> Run
+    _started: datetime = field(default_factory=lambda: datetime.now(UTC), init=False)
 
     async def run(self) -> None:
         self._install_signal_handlers()
         try:
-            started = datetime.now(UTC)
+            self._started = datetime.now(UTC)
             for job in self.jobs:
-                self._since.setdefault(job.name, started)
+                self._since.setdefault(job.name, self._started)
 
-            async with asyncio.TaskGroup() as tg:
+            async with self._control_server(), asyncio.TaskGroup() as tg:
                 self._recover(tg)
                 for job in self._enabled():
                     fires = self._plan_catch_up(job)
@@ -93,6 +98,61 @@ class Scheduler:
             await notify.drain()
         finally:
             self._remove_signal_handlers()
+
+    def _control_server(self) -> AbstractAsyncContextManager[object]:
+        if not self.control:
+            return contextlib.nullcontext()
+        from punctual.control import ControlServer  # deferred: optional feature
+
+        return ControlServer(self)
+
+    # --- driven from the control socket / signals --------------------
+    def request_drain(self) -> None:
+        self._stopping.set()
+        self._wake.set()
+
+    def request_kill(self) -> None:
+        log.warning("stop --kill — SIGKILL %d in-flight job(s)", len(self._running))
+        for run in list(self._running.values()):
+            if run.pid is not None:
+                kill_group(run.pid)
+
+    def in_flight(self) -> int:
+        return len(self._running)
+
+    def control_status(self) -> dict[str, object]:
+        import os
+
+        return {
+            "pid": os.getpid(),
+            "jobs": len(self._enabled()),
+            "uptime_s": round((datetime.now(UTC) - self._started).total_seconds()),
+            "in_flight": self.in_flight(),
+        }
+
+    def reload(self) -> dict[str, object]:
+        if self.config_reload is None:
+            return {"ok": False, "error": "daemon has no config path to reload"}
+        try:
+            new = self.config_reload()
+        except Exception as e:  # bad config — keep running the old one
+            return {"ok": False, "error": f"config invalid, not applied: {e}"}
+        old_by = {j.name: j for j in self.jobs}
+        new_by = {j.name: j for j in new}
+        added = sorted(new_by.keys() - old_by.keys())
+        removed = sorted(old_by.keys() - new_by.keys())
+        changed = sorted(n for n in old_by.keys() & new_by.keys() if old_by[n] != new_by[n])
+
+        self.jobs = [j for n, j in old_by.items() if n not in removed] + [new_by[n] for n in added]
+        now = datetime.now(UTC)
+        for n in added:
+            self._since.setdefault(n, now)
+        for n in removed:
+            self._since.pop(n, None)
+        self._wake.set()
+        log.info("reload: added=%s removed=%s changed=%s", added, removed, changed)
+        note = "changed jobs keep their old definition — restart to apply" if changed else ""
+        return {"added": added, "removed": removed, "changed": changed, "note": note}
 
     def _job(self, name: str) -> Job | None:
         return next((j for j in self.jobs if j.name == name), None)
@@ -480,17 +540,23 @@ class Scheduler:
 
     def _request_stop(self) -> None:
         if self._stopping.is_set():
-            # second signal: stop --kill — SIGKILL every in-flight job's group.
-            # Those runs come back with a signal exit code and land as FAILED.
-            log.warning("second signal — killing %d in-flight job(s)", len(self._running))
-            for run in list(self._running.values()):
-                if run.pid is not None:
-                    kill_group(run.pid)
+            self.request_kill()  # second signal escalates to stop --kill
             return
         log.info("draining — no new fires; waiting for %d in-flight run(s)", len(self._running))
-        self._stopping.set()
-        self._wake.set()
+        self.request_drain()
 
 
-async def serve(jobs: list[Job], store: Store, instance_id: str) -> None:
-    await Scheduler(jobs=jobs, store=store, instance_id=instance_id).run()
+async def serve(
+    jobs: list[Job],
+    store: Store,
+    instance_id: str,
+    *,
+    config_reload: Callable[[], list[Job]] | None = None,
+) -> None:
+    await Scheduler(
+        jobs=jobs,
+        store=store,
+        instance_id=instance_id,
+        control=True,
+        config_reload=config_reload,
+    ).run()

@@ -214,15 +214,77 @@ def run(ctx: click.Context, verbose: bool) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
+    path = ctx.obj["config_path"]
     jobs = _load(ctx)
     store = SqliteStore()
     n = sum(1 for j in jobs if j.enabled)
     click.secho(f"punctual: {n} job(s) armed · state at {store.path}", fg="green")
     try:
-        asyncio.run(serve(jobs, store, _instance_id()))
+        asyncio.run(serve(jobs, store, _instance_id(), config_reload=lambda: load_config(path)))
     finally:
         store.close()
     click.echo("punctual: stopped")
+
+
+def _talk(cmd: str, **kw: Any) -> dict[str, Any]:
+    from punctual import control
+
+    try:
+        return control.request(cmd, **kw)
+    except control.NotRunning as e:
+        raise click.ClickException(str(e)) from e
+
+
+@main.command()
+def ping() -> None:
+    """Check the running daemon is alive."""
+    r = _talk("ping")
+    click.echo(
+        f"pid {r['pid']}, {r['jobs']} job(s), {r['in_flight']} in flight, up {r['uptime_s']}s"
+    )
+
+
+@main.command()
+def drain() -> None:
+    """Tell the daemon to stop claiming and exit once in-flight runs finish."""
+    r = _talk("drain")
+    click.secho(
+        f"draining — {r['in_flight']} run(s) in flight; the daemon exits when idle", fg="green"
+    )
+
+
+@main.command()
+@click.option("--kill", is_flag=True, help="SIGKILL in-flight jobs instead of waiting")
+@click.option("--timeout", default=60.0, show_default=True, help="seconds to wait for exit")
+def stop(kill: bool, timeout: float) -> None:
+    """Drain (or --kill) the daemon and wait for it to exit."""
+    from punctual import control
+
+    _talk("stop", kill=kill)
+    click.echo("killing in-flight jobs…" if kill else "draining…")
+    if control.wait_until_gone(timeout=timeout):
+        click.secho("daemon stopped", fg="green")
+    else:
+        raise click.ClickException(f"daemon still running after {timeout:g}s")
+
+
+@main.command()
+def reload() -> None:
+    """Re-read the config: add new jobs, drop removed ones (changed jobs need a restart)."""
+    r = _talk("reload")
+    if not r.get("ok"):
+        raise click.ClickException(str(r.get("error")))
+    for label, names in (
+        ("added", r["added"]),
+        ("removed", r["removed"]),
+        ("changed", r["changed"]),
+    ):
+        if names:
+            click.echo(f"  {label}: {', '.join(names)}")
+    if r["note"]:
+        click.secho(f"  note: {r['note']}", fg="yellow")
+    if not (r["added"] or r["removed"] or r["changed"]):
+        click.echo("  no changes")
 
 
 @main.command()
