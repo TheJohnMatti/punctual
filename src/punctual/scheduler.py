@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from punctual import notify
+from punctual.control import ControlServer
 from punctual.executor import Sentinel, execute, kill_group, read_sentinel
 from punctual.models import (
     FAILURE_OUTCOMES,
@@ -102,8 +103,6 @@ class Scheduler:
     def _control_server(self) -> AbstractAsyncContextManager[object]:
         if not self.control:
             return contextlib.nullcontext()
-        from punctual.control import ControlServer  # deferred: optional feature
-
         return ControlServer(self)
 
     # --- driven from the control socket / signals --------------------

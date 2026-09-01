@@ -20,12 +20,20 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from punctual.scheduler import Scheduler
+from typing import Any, Protocol
 
 log = logging.getLogger("punctual.control")
+
+
+class Controllable(Protocol):
+    """What `ControlServer` needs from the scheduler — kept structural so this
+    module doesn't import `punctual.scheduler` (no import cycle)."""
+
+    def request_drain(self) -> None: ...
+    def request_kill(self) -> None: ...
+    def in_flight(self) -> int: ...
+    def control_status(self) -> dict[str, object]: ...
+    def reload(self) -> dict[str, object]: ...
 
 
 def socket_path() -> Path:
@@ -37,7 +45,7 @@ def socket_path() -> Path:
 
 # --- server -------------------------------------------------------------
 class ControlServer:
-    def __init__(self, scheduler: Scheduler, path: Path | None = None) -> None:
+    def __init__(self, scheduler: Controllable, path: Path | None = None) -> None:
         self._sched = scheduler
         self._path = path or socket_path()
         self._server: asyncio.Server | None = None
