@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from click.testing import CliRunner
 
 from punctual.cli import main
-from punctual.models import RunState
+from punctual.models import JobState, RunState
 from punctual.store import SqliteStore
 
 DEMO = """
@@ -64,3 +64,30 @@ def test_history_shows_recorded_runs(tmp_path, monkeypatch):
     assert r.exit_code == 0
     assert "hello" in r.output
     assert "succeeded" in r.output
+
+
+def test_status_and_resume_a_quarantined_job(tmp_path, monkeypatch):
+    db = tmp_path / "p.db"
+    monkeypatch.setenv("PUNCTUAL_DB", str(db))
+    store = SqliteStore(db)
+    store.save_job_state(
+        JobState(
+            job="hello",
+            consecutive_failures=5,
+            quarantined_at=datetime.now(UTC),
+            quarantine_reason="5 consecutive failed fires",
+            skipped_quarantined=12,
+        )
+    )
+    store.close()
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "status"])
+    assert r.exit_code == 0
+    assert "QUARANTINED" in r.output and "12 fires skipped" in r.output
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "resume", "hello"])
+    assert r.exit_code == 0 and "resume requested" in r.output
+    assert SqliteStore(db).job_state("hello").resume_requested is True
+
+    r = CliRunner().invoke(main, ["-c", _cfg(tmp_path), "resume", "nope"])
+    assert r.exit_code != 0 and "no job named" in r.output

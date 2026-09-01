@@ -68,7 +68,10 @@ Proposed v0 fields per `[job.<name>]`:
 | `idempotent` | bool | default `false`; safe to re-run. Drives process-group placement + `on_lost` default (O2b) |
 | `on_lost` | enum | `fail` \| `retry`; default derived from `idempotent` (O2b) |
 | `concurrency` | int | max simultaneous runs of THIS job; default 1 |
-| `on_fail` / `on_missed_alert` | URI | notification sink after quarantine |
+| `quarantine_after` | int | consecutive failed *fires* → `QUARANTINED`; default 5, `0` disables (O9) |
+| `quarantine_cooldown` | duration | opt-in: after this, let one probe fire through (O9) |
+| `on_fail` | URI | notify: a fire exhausted its retries (O10) |
+| `on_quarantine` | URI | notify: the job was quarantined (O10) |
 | `enabled` | bool | default true |
 | `workdir`, `env`, `user` | | cron-parity knobs |
 
@@ -237,6 +240,41 @@ row whose pid is gone and resolves the run to `SUCCEEDED` / `FAILED` /
 `recovered_from_sentinel` is logged. `run_dir` is deleted once a run reaches a
 non-retryable terminal state. Cost: one lightweight Python process per run.
 
+### O9 — Quarantine  *(built — M2 slice 2)*
+Circuit-breaker per job, state on the `job_clock` row (now the general per-job
+state row, `models.JobState`).
+
+- **Counts *fires*, not attempts.** `_update_health` runs once per fire, after
+  retries are spent. `consecutive_failures++` on a final outcome in
+  `FAILURE_OUTCOMES` (`FAILED` / `TIMED_OUT` / `LOST`); **one success resets it
+  to 0.** A flaky-but-recovers job never trips.
+- At `quarantine_after` (default 5, `0` disables) → `quarantined_at` is stamped,
+  `quarantine_reason` recorded. The tick loop then **skips** the job's fires,
+  advancing its clock and incrementing `skipped_quarantined` — no per-fire rows,
+  no catch-up storm on resume. `_plan_catch_up` and `_sweep_retries` also skip a
+  quarantined job.
+- **Out of quarantine:** `punctual resume <job>` sets `resume_requested`; the
+  daemon clears the breaker on its next tick (works with the daemon up or down —
+  no control socket needed, that's slice 4). Or, opt-in per job,
+  `quarantine_cooldown = "1h"`: after it elapses one **probe** fire is allowed
+  through — success clears the breaker, failure re-stamps `quarantined_at`
+  (restarting the cooldown).
+- `punctual status` shows per-job health / quarantine at a glance.
+
+### O10 — Notifications  *(started — M2 slice 2; full plugin surface is M3)*
+Two hooks, both `str | None` URIs on `Job`: **`on_fail`** fires each time a fire
+exhausts its retries; **`on_quarantine`** fires when the breaker opens.
+
+- Built-in sinks (`punctual.notify`): `exec:<argv template>` (shlex-split,
+  `{job}` / `{reason}` / `{event}` substituted, full event JSON on stdin and in
+  `$PUNCTUAL_EVENT`) and `http(s)://…` (POST the event as JSON). `ntfy://`,
+  `slack://`, `on_recovery`, digest mode, and the entry-point plugin surface
+  (IDEAS §2) land in M3.
+- Fire-and-forget: `notify.fire` schedules a task, held in `notify._inflight`;
+  `notify.drain()` at shutdown gives outstanding sends up to 10 s. A sink that
+  errors or times out is logged at WARNING and dropped — **notifications never
+  affect scheduling.**
+
 ---
 
 ## Milestones
@@ -263,8 +301,10 @@ non-retryable terminal state. Cost: one lightweight Python process per run.
 - **M2 — it's reliable**. Built in slices:
   - *slice 1 ✅* — retries + backoff (O8), durable `RETRYING` rows swept by the
     tick loop, exit-code sentinel (O2b addendum), `history` shows `#attempt`.
-  - *slice 2* — quarantine: consecutive-failure count → `QUARANTINED` stops the
-    job; fire the `on_fail` notification URI.
+  - *slice 2 ✅* — quarantine circuit-breaker (O9): per-*fire* failure count →
+    `QUARANTINED` skips the job; `punctual resume` + opt-in `quarantine_cooldown`
+    probe; `punctual status`. Notifications (O10): `on_fail` / `on_quarantine`
+    hooks, `exec:` + `http(s):` sinks.
   - *slice 3* — `punctual why <job>` + richer `plan` (retry/quarantine state,
     why a fire was skipped/capped).
   - *slice 4* — control socket → `punctual drain` / `stop --kill` / `reload`.

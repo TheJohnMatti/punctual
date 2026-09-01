@@ -31,7 +31,9 @@ _JOB_KEYS = {
     "catch_up_cap",
     "concurrency",
     "quarantine_after",
+    "quarantine_cooldown",
     "on_fail",
+    "on_quarantine",
     "workdir",
     "env",
     "enabled",
@@ -117,6 +119,7 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
         concurrency=int(raw.get("concurrency", 1)),
         quarantine_after=int(raw.get("quarantine_after", 5)),
         on_fail=raw.get("on_fail"),
+        on_quarantine=raw.get("on_quarantine"),
         workdir=raw.get("workdir"),
         env={str(k): str(v) for k, v in raw.get("env", {}).items()},
         enabled=bool(raw.get("enabled", True)),
@@ -137,6 +140,8 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
             ) from e
     if "timeout" in raw:
         job.timeout = parse_duration(raw["timeout"])
+    if "quarantine_cooldown" in raw:
+        job.quarantine_cooldown = parse_duration(raw["quarantine_cooldown"])
     return job
 
 

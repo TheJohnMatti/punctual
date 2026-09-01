@@ -89,6 +89,9 @@ class InvalidTransition(RuntimeError):
 # timed-out job is usually a transiently slow dependency, so it retries too.
 RETRYABLE_OUTCOMES = frozenset({RunState.FAILED, RunState.TIMED_OUT})
 
+# M2.2a: a fire whose *final* outcome is one of these counts toward quarantine.
+FAILURE_OUTCOMES = frozenset({RunState.FAILED, RunState.TIMED_OUT, RunState.LOST})
+
 
 @dataclass(slots=True)
 class RetryPolicy:
@@ -124,8 +127,10 @@ class Job:
     on_lost: OnLost | None = None  # None -> derive from idempotent (O2b)
     catch_up_cap: int = 25  # run_each: max missed fires to replay on restart; 0 = uncapped (O3)
     concurrency: int = 1  # max simultaneous runs of THIS job
-    quarantine_after: int = 5  # consecutive failures -> QUARANTINED
-    on_fail: str | None = None  # notification URI
+    quarantine_after: int = 5  # consecutive failed fires -> QUARANTINED (0 disables)
+    quarantine_cooldown: timedelta | None = None  # let one probe fire through after this
+    on_fail: str | None = None  # notify URI: a fire exhausted its retries
+    on_quarantine: str | None = None  # notify URI: the job was quarantined
     workdir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
@@ -136,6 +141,29 @@ class Job:
         if self.on_lost is not None:
             return self.on_lost
         return OnLost.RETRY if self.idempotent else OnLost.FAIL
+
+
+@dataclass(slots=True)
+class JobState:
+    """Per-job state that outlives any single run (store.job_clock row).
+
+    ``consecutive_failures`` counts *fires* (not attempts) whose final outcome
+    was a failure; one success resets it. At ``Job.quarantine_after`` the job is
+    quarantined: ``quarantined_at`` is set and its fires are skipped (counted in
+    ``skipped_quarantined``) until a `punctual resume` or a cooldown probe.
+    """
+
+    job: str
+    last_fire: datetime | None = None
+    consecutive_failures: int = 0
+    quarantined_at: datetime | None = None
+    quarantine_reason: str | None = None
+    skipped_quarantined: int = 0
+    resume_requested: bool = False
+
+    @property
+    def quarantined(self) -> bool:
+        return self.quarantined_at is not None
 
 
 @dataclass(slots=True)

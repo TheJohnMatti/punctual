@@ -11,12 +11,16 @@ when its backoff elapses — so a retry pending across a restart isn't lost.
 Every run is wrapped by ``punctual._runner``, which records an exit sentinel so
 a run the daemon lost mid-flight resolves to its real outcome, not a blind LOST.
 
+A job that fails `quarantine_after` fires in a row is **quarantined** (O9): its
+fires are skipped until `punctual resume` or a `quarantine_cooldown` probe.
+`on_fail` / `on_quarantine` URIs are dispatched fire-and-forget (O10).
+
 Shutdown: the first SIGINT/SIGTERM is a **drain** — stop claiming, let in-flight
 runs finish, exit. A second signal is **stop --kill** — SIGKILL every in-flight
 job's process group; those runs land FAILED.
 
-Deliberately *not* here yet: quarantine + `on_fail` notify (M2 slice 2),
-`punctual why` (M2 slice 3).
+Deliberately *not* here yet: `punctual why` (M2 slice 3), the control socket for
+`punctual drain` / `stop` / `reload` (M2 slice 4).
 """
 
 from __future__ import annotations
@@ -30,11 +34,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from punctual import notify
 from punctual.executor import Sentinel, execute, kill_group, read_sentinel
 from punctual.models import (
+    FAILURE_OUTCOMES,
     RETRYABLE_OUTCOMES,
     InvalidTransition,
     Job,
+    JobState,
     MissedPolicy,
     OnLost,
     Run,
@@ -83,6 +90,7 @@ class Scheduler:
                     self._sweep_retries(tg)
                     await self._sleep(self._time_to_next())
             # exiting the TaskGroup waits for in-flight runs to finish (drain)
+            await notify.drain()
         finally:
             self._remove_signal_handlers()
 
@@ -144,6 +152,7 @@ class Scheduler:
             self._schedule_retry(job, run, delay=timedelta(0))
         else:
             log.error("LOST %s run %s — on_lost=fail, needs a human", run.job, run.id)
+            self._update_health(job, run, RunState.LOST)
 
     def _resolve_from_sentinel(self, job: Job, run: Run, sentinel: Sentinel) -> None:
         run.finished_at = datetime.now(UTC)
@@ -186,6 +195,9 @@ class Scheduler:
         """
         baseline = self.store.last_fire(job.name)
         now = datetime.now(UTC)
+        if self.store.job_state(job.name).quarantined:
+            self._since[job.name] = now  # a quarantined job doesn't backfill
+            return []
         if baseline is None:  # first run ever / brand-new job — no history to catch up
             self._since[job.name] = now
             return []
@@ -235,14 +247,39 @@ class Scheduler:
             if due is None:
                 continue
             self._since[job.name] = due
+
+            state = self.store.job_state(job.name)
+            if state.quarantined and not self._quarantine_lets_fire_through(job, state, now):
+                state.skipped_quarantined += 1
+                self.store.save_job_state(state)
+                self.store.set_last_fire(job.name, due)  # no catch-up storm on resume
+                continue
+
             if self._inflight[job.name] >= job.concurrency:
                 # a prior run of this job is still going; drop the fire rather
-                # than queue it. TODO M2: record SKIPPED + metric.
+                # than queue it. TODO M2 slice 3: record SKIPPED + metric.
                 continue
             run = self.store.claim(job.name, due, self.instance_id)
             if run is None:
                 continue  # already claimed (another daemon, or recovery)
             self._launch(job, run, tg)
+
+    def _quarantine_lets_fire_through(self, job: Job, state: JobState, now: datetime) -> bool:
+        """Despite quarantine, run this fire? — an operator resume, or a cooldown probe."""
+        if state.resume_requested:
+            log.info("%s: resume requested by operator — quarantine cleared", job.name)
+            self._clear_quarantine(state)
+            self.store.save_job_state(state)
+            return True
+        if (
+            job.quarantine_cooldown is not None
+            and state.quarantined_at is not None
+            and now - state.quarantined_at >= job.quarantine_cooldown
+            and self._inflight[job.name] == 0
+        ):
+            log.info("%s: cooldown elapsed — letting one probe fire through", job.name)
+            return True
+        return False
 
     def _latest_due(self, job: Job, now: datetime) -> datetime | None:
         """Most recent fire in ``(_since[job], now]``. Collapses a backlog to its
@@ -276,6 +313,8 @@ class Scheduler:
             job = self._job(run.job)
             if job is None or not job.enabled:
                 continue
+            if self.store.job_state(job.name).quarantined:
+                continue  # job is out — its pending retry waits too
             if self._inflight[job.name] >= job.concurrency:
                 continue  # still busy; try again next tick
             run.transition_to(RunState.CLAIMED)  # RETRYING -> CLAIMED
@@ -305,6 +344,7 @@ class Scheduler:
         if retryable and run.attempt <= job.retries.max:
             self._schedule_retry(job, run, job.retries.delay_for_attempt(run.attempt))
             return
+        # this fire is now final — a success, or every retry is spent
         if retryable and job.retries.max:
             log.warning(
                 "%s run %s: retries exhausted (attempt %d of %d) — %s stands",
@@ -315,6 +355,68 @@ class Scheduler:
                 outcome.value,
             )
         self._cleanup_run_dir(run)
+        self._update_health(job, run, outcome)
+
+    # --- quarantine (M2 slice 2) ---------------------------------------
+    def _update_health(self, job: Job, run: Run, outcome: RunState) -> None:
+        state = self.store.job_state(job.name)
+        if outcome in FAILURE_OUTCOMES:
+            state.consecutive_failures += 1
+            self._notify(job.on_fail, "fail", job, run, state, outcome)
+            if state.quarantined:
+                state.quarantined_at = datetime.now(UTC)  # failed probe — restart cooldown
+                log.warning("%s: quarantine probe failed — still quarantined", job.name)
+            elif job.quarantine_after and state.consecutive_failures >= job.quarantine_after:
+                state.quarantined_at = datetime.now(UTC)
+                state.quarantine_reason = (
+                    f"{state.consecutive_failures} consecutive failed fires (last: {outcome.value})"
+                )
+                log.error(
+                    "QUARANTINED %s — %s. Fires skipped until `punctual resume %s`.",
+                    job.name,
+                    state.quarantine_reason,
+                    job.name,
+                )
+                self._notify(job.on_quarantine, "quarantine", job, run, state, outcome)
+            self.store.save_job_state(state)
+        elif state.quarantined:  # a probe succeeded
+            log.info(
+                "%s: recovered — quarantine cleared (%d fires had been skipped)",
+                job.name,
+                state.skipped_quarantined,
+            )
+            self._clear_quarantine(state)
+            self.store.save_job_state(state)
+        elif state.consecutive_failures:
+            state.consecutive_failures = 0
+            self.store.save_job_state(state)
+
+    @staticmethod
+    def _clear_quarantine(state: JobState) -> None:
+        state.quarantined_at = None
+        state.quarantine_reason = None
+        state.consecutive_failures = 0
+        state.skipped_quarantined = 0
+        state.resume_requested = False
+
+    def _notify(
+        self, uri: str | None, event: str, job: Job, run: Run, state: JobState, outcome: RunState
+    ) -> None:
+        if not uri:
+            return
+        notify.fire(
+            uri,
+            {
+                "event": event,
+                "job": job.name,
+                "reason": state.quarantine_reason or f"run {outcome.value}",
+                "attempt": run.attempt,
+                "scheduled_for": run.scheduled_for.isoformat(),
+                "exit_code": run.exit_code,
+                "consecutive_failures": state.consecutive_failures,
+                "at": datetime.now(UTC).isoformat(timespec="seconds"),
+            },
+        )
 
     def _cleanup_run_dir(self, run: Run) -> None:
         if run.id is not None:
