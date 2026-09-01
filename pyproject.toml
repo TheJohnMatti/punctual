@@ -27,6 +27,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `pip install punctual-scheduler[tui]` — the core stays at click + croniter.
+tui = ["textual>=0.60"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
@@ -36,6 +38,7 @@ dev = [
     "pre-commit>=3.8",
     "pytest-cov>=5",
     "pytest-xdist>=3",
+    "textual>=0.60",
 ]
 
 [project.scripts]

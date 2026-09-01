@@ -52,7 +52,7 @@ $ punctual resume retrain      # take a job out of quarantine
 $ punctual reload              # apply added / removed jobs without a restart
 $ punctual stop --kill         # drain (or hard-kill) the running daemon
 $ punctual metrics             # Prometheus text; also GET /metrics if a port is set
-$ punctual tui                 # live dashboard                          (coming, M3)
+$ punctual tui                 # read-only dashboard (pip install punctual-scheduler[tui])
 ```
 
 Set `[observability] metrics_port = 9095` in `punctual.toml` and the daemon
@@ -86,13 +86,13 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2 + M3 through slice 2):** scheduling, subprocess
+> **What works today (M1 + M2 + M3 through slice 3):** scheduling, subprocess
 > exec with output capture + timeouts, durable history, restart recovery +
 > catch-up, retries with backoff, a quarantine circuit-breaker + failure/recovery
 > notifications, `why` / `status` / annotated `plan`, a control socket (`drain` /
-> `stop` / `reload`), Prometheus `/metrics` + `/healthz`, and structured JSON
-> logs (`--log-format json`). **Not yet:** a TUI, notification plugins, job
-> dependencies. See [`docs/DESIGN.md`](docs/DESIGN.md).
+> `stop` / `reload`), Prometheus `/metrics` + `/healthz`, structured JSON logs
+> (`--log-format json`), and a read-only TUI. **Not yet:** notification plugins,
+> job dependencies. See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 
