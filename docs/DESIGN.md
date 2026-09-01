@@ -362,7 +362,12 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
     `level` / `logger` / `msg` + any `extra=` fields). Key transitions carry
     `event` + `job` / `run_id` / `state` / … : `run_finished`, `run_lost`,
     `quarantined`, `recovered`, `reload`. `text` stays the default.
-  - *slice 3* — `punctual tui` (Textual, optional extra `[tui]`).
+  - *slice 3 ✅* — `punctual tui` (`punctual/tui.py`): read-only Textual
+    dashboard, polls the store + config every 1s (reuses `introspect.py`), works
+    with the daemon down. Jobs table (health / last run / next fire) + a detail
+    panel per job (quarantine, pending retry, recent runs, stored output tail).
+    Ships as `punctual-scheduler[tui]`; `punctual tui` prints an install hint if
+    Textual is missing.
   - *slice 4* — notification plugin surface (entry-point sinks: `ntfy://`, …).
   - OTel spans + `TRACEPARENT` injection — optional extra `[otel]`, post-M3.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.

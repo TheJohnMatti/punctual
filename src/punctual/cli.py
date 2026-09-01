@@ -67,6 +67,20 @@ def main(ctx: click.Context, config_path: Path) -> None:
 
 @main.command()
 @click.pass_context
+def tui(ctx: click.Context) -> None:
+    """Live read-only dashboard (needs `pip install punctual-scheduler[tui]`)."""
+    try:
+        from punctual.tui import run_tui
+    except ImportError as e:
+        raise click.ClickException(
+            f"the TUI needs Textual — `pip install punctual-scheduler[tui]` ({e})"
+        ) from e
+    _load(ctx)  # fail fast on a broken config
+    run_tui(ctx.obj["config_path"])
+
+
+@main.command()
+@click.pass_context
 def validate(ctx: click.Context) -> None:
     """Parse and check punctual.toml. Exit non-zero on any problem."""
     jobs = _load(ctx)
