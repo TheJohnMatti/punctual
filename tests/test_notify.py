@@ -47,3 +47,63 @@ async def test_webhook_sink_posts_json(tmp_path):
 async def test_a_broken_sink_does_not_raise():
     await notify.send("exec:/no/such/program", EVENT)  # logs, returns normally
     await notify.send("ftp://nope", EVENT)  # unknown scheme
+
+
+def test_check_flags_unknown_schemes():
+    problems = notify.check(["ntfy://alerts", "slakc://typo", None, "exec:echo hi"])
+    assert list(problems) == ["slakc://typo"]
+
+
+async def test_ntfy_slack_discord_hit_the_right_url(monkeypatch):
+    seen: list = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append((req.full_url, req.data, dict(req.headers)))
+
+        class R:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        return R()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    await notify.send("ntfy://mytopic", EVENT)
+    await notify.send("slack://T1/B2/tok", EVENT)
+    await notify.send("discord://111/tok", EVENT)
+
+    urls = [s[0] for s in seen]
+    assert urls == [
+        "https://ntfy.sh/mytopic",
+        "https://hooks.slack.com/services/T1/B2/tok",
+        "https://discord.com/api/webhooks/111/tok",
+    ]
+    assert seen[0][2].get("Priority") == "high"  # a "fail" event
+    assert json.loads(seen[1][1])["text"].startswith("punctual: backup")
+
+
+async def test_entry_point_plugin_is_discovered(monkeypatch):
+    hits: list[str] = []
+
+    async def my_sink(uri, event):
+        hits.append(uri)
+
+    class _EP:
+        name = "custom"
+
+        def load(self):
+            return my_sink
+
+    monkeypatch.setattr(notify, "entry_points", lambda group: [_EP()])
+    notify.load_sinks()
+    try:
+        assert "custom" in notify._registry
+        await notify.send("custom://whatever", EVENT)
+        assert hits == ["custom://whatever"]
+    finally:
+        notify.load_sinks()  # restore the real registry

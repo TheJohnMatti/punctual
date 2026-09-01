@@ -300,19 +300,27 @@ client; `stop` polls `ping` until the socket goes away. `NotRunning` is raised
 when nothing is listening. `why` / `status` stay DB-only (slice 3) — the socket
 is additive, and the seam for a future `punctual web`.
 
-### O10 — Notifications  *(started — M2 slice 2; full plugin surface is M3)*
-Two hooks, both `str | None` URIs on `Job`: **`on_fail`** fires each time a fire
-exhausts its retries; **`on_quarantine`** fires when the breaker opens.
+### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
+Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
+retries), **`on_quarantine`** (the breaker opens), **`on_recovery`** (a
+quarantined / degraded job succeeds again — M3 slice 1).
 
-- Built-in sinks (`punctual.notify`): `exec:<argv template>` (shlex-split,
-  `{job}` / `{reason}` / `{event}` substituted, full event JSON on stdin and in
-  `$PUNCTUAL_EVENT`) and `http(s)://…` (POST the event as JSON). `ntfy://`,
-  `slack://`, `on_recovery`, digest mode, and the entry-point plugin surface
-  (IDEAS §2) land in M3.
+- **A sink is `async def send(uri, event) -> None`** (plain `def` awaited if it
+  returns a coroutine), keyed by URI scheme in a registry. Built-ins:
+  `exec:<argv template>` (`{job}`/`{reason}`/`{event}` substituted; event JSON
+  on stdin + `$PUNCTUAL_EVENT`), `http(s)://` (POST the event verbatim),
+  `ntfy://[host/]topic`, `slack://T../B../tok`, `discord://id/tok`.
+- **Plugins** register `punctual.sinks` entry points (`name` = scheme →
+  callable). `notify.load_sinks()` runs at daemon start; a plugin that fails to
+  import is logged and skipped. `notify.check()` (called by `Scheduler.run` and
+  `punctual validate`) flags any configured URI whose scheme has no sink —
+  `run` warns + disables that hook, `validate` exits non-zero.
 - Fire-and-forget: `notify.fire` schedules a task, held in `notify._inflight`;
   `notify.drain()` at shutdown gives outstanding sends up to 10 s. A sink that
   errors or times out is logged at WARNING and dropped — **notifications never
   affect scheduling.**
+- Later: digest mode, SMTP / PagerDuty sinks (third-party plugins), per-hook
+  templating.
 
 ---
 
@@ -368,7 +376,9 @@ exhausts its retries; **`on_quarantine`** fires when the breaker opens.
     panel per job (quarantine, pending retry, recent runs, stored output tail).
     Ships as `punctual-scheduler[tui]`; `punctual tui` prints an install hint if
     Textual is missing.
-  - *slice 4* — notification plugin surface (entry-point sinks: `ntfy://`, …).
+  - *slice 4 ✅* — notification sink registry + `punctual.sinks` entry-point
+    plugins; built-in `ntfy` / `slack` / `discord`; startup + `validate`
+    checks (O10). **⇒ M3 done.**
   - OTel spans + `TRACEPARENT` injection — optional extra `[otel]`, post-M3.
 - **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
