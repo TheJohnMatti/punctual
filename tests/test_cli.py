@@ -131,6 +131,36 @@ def test_plan_annotates_quarantined(tmp_path, monkeypatch):
     assert "quarantined" in r.output
 
 
+def test_graph_text_and_dot(tmp_path):
+    p = tmp_path / "punctual.toml"
+    p.write_text(
+        '[job.a]\nschedule="0 * * * *"\ncommand="true"\n'
+        '[job.b]\ncommand="true"\nafter=["a"]\n'
+        '[job.c]\ncommand="true"\nafter=["b"]\n'
+    )
+    r = CliRunner().invoke(main, ["-c", str(p), "graph"])
+    assert r.exit_code == 0
+    assert "a  [0 * * * *]" in r.output and "└─ b" in r.output and "└─ c" in r.output
+
+    r = CliRunner().invoke(main, ["-c", str(p), "graph", "--format", "dot"])
+    assert r.exit_code == 0
+    assert '"a" -> "b";' in r.output and "digraph punctual" in r.output
+
+
+def test_why_shows_trigger_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUNCTUAL_DB", str(tmp_path / "p.db"))
+    p = tmp_path / "punctual.toml"
+    p.write_text(
+        '[job.hello]\nschedule="* * * * * *"\ncommand="echo hi"\n'
+        '[job.after_hello]\ncommand="true"\nafter=["hello"]\n'
+    )
+    r = CliRunner().invoke(main, ["-c", str(p), "why", "after_hello"])
+    assert r.exit_code == 0
+    assert "trigger" in r.output and "waiting" in r.output
+    r = CliRunner().invoke(main, ["-c", str(p), "why", "hello"])
+    assert "feeds      after_hello" in r.output
+
+
 def test_control_commands_report_no_daemon(tmp_path, monkeypatch):
     monkeypatch.setenv("PUNCTUAL_SOCKET", "/tmp/pnc-cli-test.sock")
     for cmd in ("ping", "metrics", "healthz", "reload", "drain"):

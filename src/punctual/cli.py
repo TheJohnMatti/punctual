@@ -136,8 +136,14 @@ def plan(ctx: click.Context, hours: int, limit: int) -> None:
 
         for j in sorted(jobs, key=lambda x: x.name):
             if j.enabled and j.schedule is None and j.name not in quarantined:
-                dep = click.style(f"↦ triggered by {', '.join(j.after)}", fg="cyan")
-                click.echo(f"  {j.name:18}  {dep}")
+                d = introspect.explain_job(j, store)["depends"]
+                colour = {"ready": "green", "waiting": "cyan", "blocked": "red"}[d["trigger_state"]]
+                waits = [u["job"] for u in d["upstreams"] if u["state"] != "ready"]
+                tail = f" (waiting on {', '.join(waits)})" if waits else ""
+                line = click.style(
+                    f"↦ {d['trigger_state']}: after {', '.join(j.after)}{tail}", fg=colour
+                )
+                click.echo(f"  {j.name:18}  {line}")
 
         retries = {r.job: r for r in (store.pending_retry(j.name) for j in jobs) if r}
         rows: list[tuple[dt.datetime, str, str]] = []
@@ -161,6 +167,48 @@ def plan(ctx: click.Context, hours: int, limit: int) -> None:
 
 
 @main.command()
+@click.option(
+    "--format", "fmt", type=click.Choice(["text", "dot"]), default="text", show_default=True
+)
+@click.pass_context
+def graph(ctx: click.Context, fmt: str) -> None:
+    """Show the `after` dependency graph (pipe --format dot to graphviz)."""
+    jobs = {j.name: j for j in _load(ctx)}
+    downstreams: dict[str, list[str]] = {n: [] for n in jobs}
+    for j in jobs.values():
+        for up in j.after:
+            downstreams[up].append(j.name)
+
+    if fmt == "dot":
+        click.echo("digraph punctual {")
+        click.echo("  rankdir=LR; node [shape=box, style=rounded];")
+        for j in jobs.values():
+            shape = 'shape=box, style="rounded,dashed"' if j.triggered else "shape=box"
+            click.echo(f'  "{j.name}" [{shape}];')
+            for up in j.after:
+                click.echo(f'  "{up}" -> "{j.name}";')
+        click.echo("}")
+        return
+
+    roots = sorted(n for n, j in jobs.items() if not j.after)
+    seen: set[str] = set()
+
+    def walk(name: str, depth: int) -> None:
+        j = jobs[name]
+        tag = j.schedule if j.schedule else f"after {', '.join(j.after)}"
+        repeat = "  ↻" if name in seen else ""
+        click.echo(f"{'  ' * depth}{'└─ ' if depth else ''}{name}  [{tag}]{repeat}")
+        if name in seen:
+            return
+        seen.add(name)
+        for child in sorted(downstreams[name]):
+            walk(child, depth + 1)
+
+    for r in roots:
+        walk(r, 0)
+
+
+@main.command()
 @click.argument("job")
 @click.argument("run_id", type=int, required=False)
 @click.option("--json", "as_json", is_flag=True, help="machine-readable output")
@@ -179,7 +227,7 @@ def why(ctx: click.Context, job: str, run_id: int | None, as_json: bool) -> None
             report = introspect.explain_run(run, store)
             _emit(report, as_json, _render_run)
         else:
-            report = introspect.explain_job(jobs[job], store)
+            report = introspect.explain_job(jobs[job], store, all_jobs=list(jobs.values()))
             _emit(report, as_json, _render_job)
     finally:
         store.close()
@@ -217,10 +265,18 @@ def _render_job(r: dict[str, Any]) -> None:
     if r["pending_retry"]:
         pr = r["pending_retry"]
         click.echo(f"  retry      attempt {pr['attempt']} pending, not before {pr['not_before']}")
-    if r["after"]:
-        click.echo(f"  triggered  by {', '.join(r['after'])}")
+    dep = r["depends"]
+    if dep:
+        dcol = {"ready": "green", "waiting": "yellow", "blocked": "red"}[dep["trigger_state"]]
+        click.echo(f"  trigger    {click.style(dep['trigger_state'], fg=dcol)}")
+        mark = {"ready": "✓", "pending": "…", "failed": "✗"}
+        for u in dep["upstreams"]:
+            extra = f" (last success {u['last_success']})" if u["last_success"] else ""
+            click.echo(f"               {mark[u['state']]} {u['job']}{extra}")
     else:
         click.echo(f"  next fire  {r['next_fire']}")
+    if r["downstreams"]:
+        click.echo(f"  feeds      {', '.join(r['downstreams'])}")
 
 
 def _render_run(r: dict[str, Any]) -> None:

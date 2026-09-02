@@ -146,7 +146,7 @@ class PunctualTUI(App[None]):
             self._busy = was_busy
             return
 
-        r = introspect.explain_job(job, store)
+        r = introspect.explain_job(job, store, all_jobs=self._jobs)
         trig = (
             f"after {', '.join(r['after'])}" if r["after"] else f"{r['schedule']}, {r['timezone']}"
         )
@@ -162,8 +162,16 @@ class PunctualTUI(App[None]):
         if r["pending_retry"]:
             pr = r["pending_retry"]
             lines.append(f"retry: attempt {pr['attempt']} at {_short(pr['not_before'])}")
-        if not r["after"]:
+        if r["depends"]:
+            d = r["depends"]
+            col = {"ready": "green", "waiting": "yellow", "blocked": "red"}[d["trigger_state"]]
+            lines.append(f"trigger: [{col}]{d['trigger_state']}[/]")
+            mark = {"ready": "✓", "pending": "…", "failed": "✗"}
+            lines += [f"  {mark[u['state']]} {u['job']}" for u in d["upstreams"]]
+        elif r["next_fire"]:
             lines.append(f"next fire: {_short(r['next_fire'])}")
+        if r["downstreams"]:
+            lines.append(f"feeds: {', '.join(r['downstreams'])}")
 
         history = store.history(job.name, limit=20)
         for run in history:

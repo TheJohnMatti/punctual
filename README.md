@@ -47,6 +47,7 @@ $ punctual status              # one line per job: health, quarantine
 $ punctual history retrain     # every run: when, how long, exit code, output
 $ punctual why retrain         # health, last run, pending retry, next fire
 $ punctual why retrain 412     # explain one run: trigger, attempts, what happened next
+$ punctual graph               # the `after` dependency tree (--format dot for graphviz)
 $ punctual resume retrain      # take a job out of quarantine
 $ punctual reload              # apply added / removed jobs without a restart
 $ punctual stop --kill         # drain (or hard-kill) the running daemon
