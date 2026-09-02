@@ -39,6 +39,14 @@ class OnLost(enum.StrEnum):
     RETRY = "retry"  # LOST -> RETRYING -> CLAIMED (new attempt)
 
 
+class UpstreamFailure(enum.StrEnum):
+    """What a triggered job (DESIGN O12) does when an upstream fire fails."""
+
+    SKIP = "skip"  # don't run; record a SKIPPED row with the reason
+    RUN = "run"  # run anyway — `after` is advisory ordering only
+    WAIT = "wait"  # hold until the upstream eventually succeeds
+
+
 class RunState(enum.StrEnum):
     """DESIGN O2 - proposed. Transitions enforced in Run.transition_to()."""
 
@@ -116,13 +124,14 @@ class Job:
     """A job definition, as parsed from punctual.toml (DESIGN O1)."""
 
     name: str
-    schedule: str  # cron expression
     command: list[str]  # argv; shell wrapping is explicit
+    schedule: str | None = None  # cron expr — exactly one of schedule / after (O12)
+    after: list[str] = field(default_factory=list)  # upstreams; this job is trigger-driven
+    on_upstream_failure: UpstreamFailure = UpstreamFailure.SKIP
     timezone: str = "UTC"  # IANA name - DESIGN O1 sub-decision
     missed: MissedPolicy = MissedPolicy.RUN_LATEST
     retries: RetryPolicy = field(default_factory=RetryPolicy)
     timeout: timedelta | None = None
-    after: list[str] = field(default_factory=list)  # dependency edges (M4)
     idempotent: bool = False  # safe to re-run; drives process group + on_lost (O2b)
     on_lost: OnLost | None = None  # None -> derive from idempotent (O2b)
     catch_up_cap: int = 25  # run_each: max missed fires to replay on restart; 0 = uncapped (O3)
@@ -142,6 +151,11 @@ class Job:
         if self.on_lost is not None:
             return self.on_lost
         return OnLost.RETRY if self.idempotent else OnLost.FAIL
+
+    @property
+    def triggered(self) -> bool:
+        """True if this job fires on upstream completion, not a clock (O12)."""
+        return bool(self.after)
 
 
 @dataclass(slots=True)
@@ -203,6 +217,7 @@ class Run:
     stderr_tail: str | None = None  # last O5.TAIL_BYTES of stderr, decoded
     not_before: datetime | None = None  # M2: a RETRYING row is due at/after this
     created_at: datetime | None = None  # when the row was claimed (for `why`)
+    note: str | None = None  # free-text: LOST cause, "upstream X failed", etc.
 
     @property
     def duration(self) -> timedelta | None:

@@ -88,7 +88,8 @@ def validate(ctx: click.Context) -> None:
     jobs = _load(ctx)
     for j in jobs:
         flag = "" if j.enabled else "  (disabled)"
-        click.echo(f"  {j.name:20} {j.schedule:16} {' '.join(j.command)}{flag}")
+        trigger = j.schedule or f"after {', '.join(j.after)}"
+        click.echo(f"  {j.name:20} {trigger:20} {' '.join(j.command)}{flag}")
 
     uris = [u for j in jobs for u in (j.on_fail, j.on_quarantine, j.on_recovery)]
     problems = notify.check(uris)
@@ -115,7 +116,7 @@ def plan(ctx: click.Context, hours: int, limit: int) -> None:
 
         catch_up = []
         for j in jobs:
-            if not j.enabled or j.name in quarantined:
+            if not j.enabled or j.name in quarantined or j.schedule is None:
                 continue
             base = store.last_fire(j.name)
             if base and (missed := list(fires_between(j.schedule, base, now, j.timezone))):
@@ -133,10 +134,15 @@ def plan(ctx: click.Context, hours: int, limit: int) -> None:
             skip = click.style("all fires ⊘ skipped (quarantined)", fg="yellow")
             click.echo(f"  {name:18}  {skip}")
 
+        for j in sorted(jobs, key=lambda x: x.name):
+            if j.enabled and j.schedule is None and j.name not in quarantined:
+                dep = click.style(f"↦ triggered by {', '.join(j.after)}", fg="cyan")
+                click.echo(f"  {j.name:18}  {dep}")
+
         retries = {r.job: r for r in (store.pending_retry(j.name) for j in jobs) if r}
         rows: list[tuple[dt.datetime, str, str]] = []
         for j in jobs:
-            if not j.enabled or j.name in quarantined:
+            if not j.enabled or j.name in quarantined or j.schedule is None:
                 continue
             rows += [(f, j.name, "") for f in fires_between(j.schedule, now, end, j.timezone)]
         for job_name, r in retries.items():
@@ -188,7 +194,8 @@ def _emit(report: dict[str, Any], as_json: bool, render: Callable[[dict[str, Any
 
 def _render_job(r: dict[str, Any]) -> None:
     colour = {"ok": "green", "degraded": "yellow", "quarantined": "red", "disabled": "bright_black"}
-    click.echo(f"{click.style(r['job'], bold=True)}  ({r['schedule']}, {r['timezone']})")
+    trig = f"after {', '.join(r['after'])}" if r["after"] else f"{r['schedule']}, {r['timezone']}"
+    click.echo(f"{click.style(r['job'], bold=True)}  ({trig})")
     click.echo(f"  health     {click.style(r['health'], fg=colour.get(r['health']))}")
     if r["quarantine"]:
         q = r["quarantine"]
@@ -210,7 +217,10 @@ def _render_job(r: dict[str, Any]) -> None:
     if r["pending_retry"]:
         pr = r["pending_retry"]
         click.echo(f"  retry      attempt {pr['attempt']} pending, not before {pr['not_before']}")
-    click.echo(f"  next fire  {r['next_fire']}")
+    if r["after"]:
+        click.echo(f"  triggered  by {', '.join(r['after'])}")
+    else:
+        click.echo(f"  next fire  {r['next_fire']}")
 
 
 def _render_run(r: dict[str, Any]) -> None:

@@ -300,6 +300,28 @@ client; `stop` polls `ping` until the socket goes away. `NotRunning` is raised
 when nothing is listening. `why` / `status` stay DB-only (slice 3) — the socket
 is additive, and the seam for a future `punctual web`.
 
+### O12 — Dependencies  *(built — M4 slice 1)*
+A job sets **exactly one** of `schedule` (clock-driven) or `after` (a list of
+upstream job names) — enforced at config load, along with cycle rejection
+(`_reject_cycles`, DFS). `Job.triggered` == `bool(after)`.
+
+- **Trigger, not gate.** A triggered job has no clock; the tick loop's
+  `_dispatch_triggered` fires it when every upstream is *satisfied*.
+- **Satisfied = "a success newer than the downstream's last fire."** Per
+  upstream: `store.last_success_fire(up)` must be `> job_clock.last_fire(down)`.
+  This coalesces catch-up (3 replayed `scrape` fires → one `process` run) and
+  won't re-run a downstream on stale data.
+- **Fan-in:** the trigger's `scheduled_for` (the claim key) is the **max** of
+  the upstreams' satisfying success times. Exact dedup across a restart.
+- **Upstream failed** (its latest run terminal-failed, newer than downstream's
+  last fire): `on_upstream_failure` — `skip` (default; a `SKIPPED` row with
+  `note = "upstream X failed"`, `last_fire` advanced so a later success
+  re-triggers), `run` (proceed, `note` set), `wait` (hold; slice 3 adds a
+  timeout).
+- The loop `_wake`s when any job with downstreams finishes, so triggers are
+  near-immediate (else within `MAX_SLEEP`). Retries / quarantine / recovery all
+  work unchanged on triggered jobs. New `runs.note` column (schema v5).
+
 ### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
 Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
 retries), **`on_quarantine`** (the breaker opens), **`on_recovery`** (a
@@ -380,6 +402,13 @@ quarantined / degraded job succeeds again — M3 slice 1).
     plugins; built-in `ntfy` / `slack` / `discord`; startup + `validate`
     checks (O10). **⇒ M3 done.**
   - OTel spans + `TRACEPARENT` injection — optional extra `[otel]`, post-M3.
-- **M4 — dependencies**: `after`, topological exec, fan-in, upstream-failure policy.
+- **M4 — dependencies** (O12). Slices:
+  - *slice 1 ✅* — `schedule` XOR `after`, cycle rejection, `_dispatch_triggered`
+    (fresh-success trigger + fan-in), `on_upstream_failure` skip/run/wait,
+    `runs.note`.
+  - *slice 2* — `plan` / `why` / `tui` / a `punctual graph` show the edges and
+    *why* a job is waiting or was skipped.
+  - *slice 3* — `on_upstream_failure = "wait"` timeout; partial fan-in;
+    re-trigger after a downstream config change.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
 - **M6 — durable steps**: `@punctual.step` in-process checkpointing.

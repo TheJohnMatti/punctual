@@ -15,10 +15,9 @@ timeout   = "20m"
 concurrency = 1
 
 [job.retrain]
-schedule  = "0 8 * * 1"                   # Mondays 08:00
-timezone  = "America/Toronto"
 command   = "python -m sniper.retrain"
-after     = ["scrape"]
+after     = ["scrape", "descriptions"]    # runs when both upstreams succeed (no clock)
+on_upstream_failure = "skip"              # don't retrain on stale data
 timeout   = "1h"
 retries   = { max = 2, backoff = "exponential", base_delay = "2m" }
 on_fail   = "ntfy://auto-sniper-alerts"

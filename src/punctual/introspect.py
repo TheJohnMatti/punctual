@@ -48,6 +48,8 @@ def explain_job(job: Job, store: Store, now: datetime | None = None) -> dict[str
     else:
         health = "ok"
 
+    nxt = None if job.schedule is None else _iso(next_fire(job.schedule, now, job.timezone))
+
     quarantine: dict[str, Any] | None = None
     if st.quarantined:
         cooldown_at = (
@@ -65,13 +67,14 @@ def explain_job(job: Job, store: Store, now: datetime | None = None) -> dict[str
     return {
         "job": job.name,
         "schedule": job.schedule,
+        "after": job.after or None,
         "timezone": job.timezone,
         "enabled": job.enabled,
         "health": health,
         "consecutive_failures": st.consecutive_failures,
         "quarantine": quarantine,
         "last_run": _run_brief(last) if last else None,
-        "next_fire": _iso(next_fire(job.schedule, now, job.timezone)),
+        "next_fire": nxt,
         "pending_retry": (
             {"attempt": retry.attempt, "not_before": _iso(retry.not_before)} if retry else None
         ),
