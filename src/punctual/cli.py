@@ -20,7 +20,7 @@ from punctual.config import ConfigError, load_config
 from punctual.models import Config, Job, RunState
 from punctual.schedule import fires_between
 from punctual.scheduler import serve
-from punctual.store import SqliteStore
+from punctual.store import SqliteStore, Store, store_from_url
 
 DEFAULT_CONFIG = "punctual.toml"
 
@@ -42,6 +42,20 @@ def _load_config(ctx: click.Context) -> Config:
 
 def _load(ctx: click.Context) -> list[Job]:
     return _load_config(ctx).jobs
+
+
+def _open_store(ctx: click.Context) -> Store:
+    """The store for the active config's ``[store]`` url — the default SQLite
+    file if the config can't be parsed (read-only commands still work)."""
+    try:
+        url = load_config(ctx.obj["config_path"]).store.url
+    except ConfigError:
+        url = None
+    return store_from_url(url)
+
+
+def _store_label(store: Store) -> str:
+    return f"state at {store.path}" if isinstance(store, SqliteStore) else "postgres store"
 
 
 def _instance_id() -> str:
@@ -108,7 +122,7 @@ def plan(ctx: click.Context, hours: int, limit: int) -> None:
     """What the daemon would do next: catch-up on start, then the next N hours of
     fires — each annotated with anything that changes the outcome."""
     jobs = _load(ctx)
-    store = SqliteStore()
+    store = _open_store(ctx)
     now = dt.datetime.now(dt.UTC)
     end = now + dt.timedelta(hours=hours)
     try:
@@ -218,7 +232,7 @@ def why(ctx: click.Context, job: str, run_id: int | None, as_json: bool) -> None
     jobs = {j.name: j for j in _load(ctx)}
     if job not in jobs:
         raise click.ClickException(f"no job named {job!r} in the config")
-    store = SqliteStore()
+    store = _open_store(ctx)
     try:
         if run_id is not None:
             run = store.get_run(run_id)
@@ -318,13 +332,13 @@ def run(ctx: click.Context, verbose: bool, log_format: str, cluster: bool) -> No
     logs.configure(log_format, verbose=verbose)
     path = ctx.obj["config_path"]
     cfg = _load_config(ctx)
-    store = SqliteStore()
+    store = _open_store(ctx)
     n = sum(1 for j in cfg.jobs if j.enabled)
     where = (
         f" · metrics :{cfg.observability.metrics_port}" if cfg.observability.metrics_port else ""
     )
     role = " · cluster" if cluster else ""
-    click.secho(f"punctual: {n} job(s) armed · state at {store.path}{where}{role}", fg="green")
+    click.secho(f"punctual: {n} job(s) armed · {_store_label(store)}{where}{role}", fg="green")
     try:
         asyncio.run(
             serve(
@@ -437,7 +451,7 @@ def reload() -> None:
 @click.pass_context
 def history(ctx: click.Context, job: str | None, limit: int) -> None:
     """Recent runs: when, duration, state, exit code."""
-    store = SqliteStore()
+    store = _open_store(ctx)
     try:
         runs = store.history(job, limit)
     finally:
@@ -460,7 +474,7 @@ def history(ctx: click.Context, job: str | None, limit: int) -> None:
 def status(ctx: click.Context, as_json: bool) -> None:
     """One line per job: health and quarantine state."""
     jobs = _load(ctx)
-    store = SqliteStore()
+    store = _open_store(ctx)
     try:
         if as_json:
             click.echo(
@@ -501,7 +515,7 @@ def resume(ctx: click.Context, job: str) -> None:
     names = {j.name for j in _load(ctx)}
     if job not in names:
         raise click.ClickException(f"no job named {job!r} in the config")
-    store = SqliteStore()
+    store = _open_store(ctx)
     try:
         st = store.job_state(job)
         if not st.quarantined:

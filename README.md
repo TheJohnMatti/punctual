@@ -99,19 +99,34 @@ $ punctual -c punctual.toml run --cluster     # host B — hot standby
 One daemon holds a 30 s lease and does all the scheduling; the other idles until
 that lease expires, then takes over (failover ≈ 30–40 s). Every node's control
 socket stays live, so `ping` / `healthz` / `metrics` work on both;
-`healthz` reports `standby` on the follower. Sharing a store across hosts wants
-Postgres rather than a SQLite file — that's M5 slice 2.
+`healthz` reports `standby` on the follower.
 
-> **What works today (M1–M5.1):** scheduling, `after` dependencies (trigger-driven,
+A cluster on one SQLite file is only as available as that host, so point it at
+Postgres:
+
+```console
+$ pip install "punctual-scheduler[postgres]"
+```
+
+```toml
+# punctual.toml
+[store]
+url = "postgresql://punctual:secret@db.internal:5432/punctual"
+```
+
+`[store] url` also takes `sqlite://<path>`; unset means the default XDG file.
+`$PUNCTUAL_STORE_URL` overrides the config.
+
+> **What works today (M1–M5):** scheduling, `after` dependencies (trigger-driven,
 > fan-in, upstream-failure policy, `wait_timeout`), `punctual trigger` for an
 > ad-hoc run, subprocess exec with output capture + timeouts, durable history,
 > restart recovery + catch-up, retries with backoff, a quarantine circuit-breaker,
 > failure/recovery notifications (`ntfy` / `slack` / `discord` / `exec` / webhook
 > / plugins), `why` / `status` / annotated `plan` / `graph`, a control socket
 > (`drain` / `stop` / `reload`), Prometheus `/metrics` + `/healthz`, structured
-> JSON logs (`--log-format json`), a read-only TUI, and lease-based leader
-> election (`run --cluster`). **Not yet:** a Postgres store (M5 slice 2), durable
-> in-process `@step` (M6). See [`docs/DESIGN.md`](docs/DESIGN.md).
+> JSON logs (`--log-format json`), a read-only TUI, lease-based leader election
+> (`run --cluster`), and a Postgres store. **Not yet:** durable in-process
+> `@step` (M6). See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 

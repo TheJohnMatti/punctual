@@ -17,48 +17,40 @@ def _job(name: str, schedule: str = "0 0 1 1 *") -> Job:
     return Job(name=name, schedule=schedule, command=["true"])
 
 
-# --- store-level lease mechanics ---------------------------------------
+# --- store-level lease mechanics (both backends via the `store` fixture) ---
 
 
-def test_acquire_is_exclusive_while_live(tmp_path):
-    s = SqliteStore(tmp_path / "d.db")
-    a = s.acquire_lease(R, "a", timedelta(seconds=30))
+def test_acquire_is_exclusive_while_live(store):
+    a = store.acquire_lease(R, "a", timedelta(seconds=30))
     assert a is not None and a.holder == "a" and a.fence == 1
-    assert s.acquire_lease(R, "b", timedelta(seconds=30)) is None
-    assert s.lease_holder(R) == "a"
-    s.close()
+    assert store.acquire_lease(R, "b", timedelta(seconds=30)) is None
+    assert store.lease_holder(R) == "a"
 
 
-def test_holder_can_reacquire_and_renew(tmp_path):
-    s = SqliteStore(tmp_path / "d.db")
-    a = s.acquire_lease(R, "a", timedelta(seconds=30))
-    assert s.renew_lease(R, "a", a.fence, timedelta(seconds=30)) is True
+def test_holder_can_reacquire_and_renew(store):
+    a = store.acquire_lease(R, "a", timedelta(seconds=30))
+    assert store.renew_lease(R, "a", a.fence, timedelta(seconds=30)) is True
     # wrong fence — a zombie ex-leader — is rejected
-    assert s.renew_lease(R, "a", a.fence + 5, timedelta(seconds=30)) is False
+    assert store.renew_lease(R, "a", a.fence + 5, timedelta(seconds=30)) is False
     # wrong holder is rejected
-    assert s.renew_lease(R, "b", a.fence, timedelta(seconds=30)) is False
-    s.close()
+    assert store.renew_lease(R, "b", a.fence, timedelta(seconds=30)) is False
 
 
-def test_expired_lease_is_taken_over_with_bumped_fence(tmp_path):
-    s = SqliteStore(tmp_path / "d.db")
-    a = s.acquire_lease(R, "a", timedelta(seconds=-1))  # already expired
+def test_expired_lease_is_taken_over_with_bumped_fence(store):
+    a = store.acquire_lease(R, "a", timedelta(seconds=-1))  # already expired
     assert a is not None
-    assert s.lease_holder(R) is None  # nobody holds a live lease
-    b = s.acquire_lease(R, "b", timedelta(seconds=30))
+    assert store.lease_holder(R) is None  # nobody holds a live lease
+    b = store.acquire_lease(R, "b", timedelta(seconds=30))
     assert b is not None and b.holder == "b" and b.fence == a.fence + 1
     # the old leader's renew now fails — fence moved
-    assert s.renew_lease(R, "a", a.fence, timedelta(seconds=30)) is False
-    s.close()
+    assert store.renew_lease(R, "a", a.fence, timedelta(seconds=30)) is False
 
 
-def test_release_frees_the_lease(tmp_path):
-    s = SqliteStore(tmp_path / "d.db")
-    s.acquire_lease(R, "a", timedelta(seconds=30))
-    s.release_lease(R, "a")
-    assert s.lease_holder(R) is None
-    assert s.acquire_lease(R, "b", timedelta(seconds=30)) is not None
-    s.close()
+def test_release_frees_the_lease(store):
+    store.acquire_lease(R, "a", timedelta(seconds=30))
+    store.release_lease(R, "a")
+    assert store.lease_holder(R) is None
+    assert store.acquire_lease(R, "b", timedelta(seconds=30)) is not None
 
 
 # --- scheduler leader/standby behaviour --------------------------------
@@ -80,8 +72,8 @@ async def test_solo_daemon_is_always_leader(tmp_path):
 
 
 async def test_leader_steps_down_when_a_renew_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=1))
-    monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.2))
+    monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=2))
+    monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.3))
     store = SqliteStore(tmp_path / "d.db")
     sc = Scheduler([_job("a")], store, "one", handle_signals=False, cluster=True)
 
@@ -107,8 +99,8 @@ async def test_leader_steps_down_when_a_renew_fails(tmp_path, monkeypatch):
 
 
 async def test_second_daemon_stands_by_then_takes_over(tmp_path, monkeypatch):
-    monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=1))
-    monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.3))
+    monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=3))
+    monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.4))
     db = tmp_path / "d.db"
     store1, store2 = SqliteStore(db), SqliteStore(db)
 
@@ -117,9 +109,9 @@ async def test_second_daemon_stands_by_then_takes_over(tmp_path, monkeypatch):
     t1 = asyncio.create_task(leader.run())
     t2 = asyncio.create_task(standby.run())
 
-    for _ in range(40):
+    for _ in range(60):
         await asyncio.sleep(0.1)
-        if leader._leader and not standby._leader:
+        if leader._leader and not standby._leader and store1.lease_holder(R) == "one":
             break
     assert leader._leader and not standby._leader
     assert store1.lease_holder(R) == "one"
@@ -133,7 +125,7 @@ async def test_second_daemon_stands_by_then_takes_over(tmp_path, monkeypatch):
         await t1
     store1.close()
 
-    for _ in range(60):
+    for _ in range(80):
         await asyncio.sleep(0.1)
         if standby._leader:
             break

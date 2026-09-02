@@ -1,23 +1,41 @@
-"""Durable state. DESIGN D4: one SQLite file (WAL), everything behind ``Store``.
+"""Durable state. DESIGN D4: everything behind the ``Store`` protocol.
 
-The ``Store`` protocol is what the scheduler talks to. ``SqliteStore`` is the
-only implementation today; a ``PostgresStore`` slots in for clustered mode (M5)
-without the scheduler noticing.
+The scheduler talks to ``Store`` and never to a driver. Two implementations
+share one query/logic core (``_BaseStore``):
 
-The one load-bearing operation is :meth:`Store.claim` — the exactly-once
-boundary (DESIGN O4). Everything else is bookkeeping.
+* ``SqliteStore`` — one WAL file, zero infra. The default.
+* ``PostgresStore`` — a shared store across hosts, so a ``--cluster`` deployment
+  (M5) is actually highly available. ``pip install punctual-scheduler[postgres]``.
+
+Both store timestamps as ISO-8601 UTC **text** (fixed ``+00:00`` offset, so
+lexical order == chronological), so the SQL is identical bar the parameter token,
+the autoincrement declaration, and how the schema version is tracked. The one
+load-bearing operation is :meth:`Store.claim` — the exactly-once boundary
+(DESIGN O4): ``INSERT … ON CONFLICT DO NOTHING RETURNING *``.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from punctual.models import JobState, Run, RunState
+
+
+class _Cursor(Protocol):
+    """The slice of the DB-API cursor both backends' `_exec` returns."""
+
+    @property
+    def rowcount(self) -> int: ...
+    def fetchone(self) -> Mapping[str, Any] | None: ...
+    def fetchall(self) -> Sequence[Mapping[str, Any]]: ...
 
 
 @dataclass(slots=True)
@@ -42,12 +60,14 @@ class Lease:
     expires_at: datetime
 
 
-# Bump when SCHEMA changes; add the matching step to _migrate().
+# Bump when SCHEMA changes; add the matching step to _BaseStore._migrate().
 SCHEMA_VERSION = 6
 
+# `{pk}` is the autoincrement primary-key declaration — the one spot the two
+# backends' DDL diverges (see _PK on each store).
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
-    id             INTEGER PRIMARY KEY,
+    id             {pk},
     job            TEXT NOT NULL,
     scheduled_for  TEXT NOT NULL,          -- ISO8601 UTC; the fire this run is for
     state          TEXT NOT NULL,
@@ -93,7 +113,7 @@ CREATE TABLE IF NOT EXISTS job_clock (
 """
 
 # Additive column adds for DBs created before a given SCHEMA_VERSION. Guarded by
-# PRAGMA table_info so it is safe to run against a fresh DB too (all no-ops).
+# a column-existence check so it is safe against a fresh DB too (all no-ops).
 _ADDED_COLUMNS = {
     "runs": {
         "pid": "INTEGER",
@@ -113,24 +133,6 @@ _ADDED_COLUMNS = {
 }
 
 
-def _migrate(db: sqlite3.Connection) -> None:
-    """Runs *before* the SCHEMA script, so SCHEMA (which may reference a new
-    column in an index) sees an already-upgraded table. A fresh DB has no tables
-    yet — nothing to alter, SCHEMA builds it complete."""
-    (version,) = db.execute("PRAGMA user_version").fetchone()
-    if version >= SCHEMA_VERSION:
-        return
-    tables = {r["name"] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    for table, columns in _ADDED_COLUMNS.items():
-        if table not in tables:
-            continue
-        have = {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}
-        for name, decl in columns.items():
-            if name not in have:
-                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-
-
 def _utc(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat(timespec="seconds")
 
@@ -146,12 +148,32 @@ def _parse_req(s: str) -> datetime:
 
 def default_db_path() -> Path:
     """XDG state dir, overridable via $PUNCTUAL_DB."""
-    import os
-
     if env := os.environ.get("PUNCTUAL_DB"):
         return Path(env)
     base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return base / "punctual" / "punctual.db"
+
+
+def store_from_url(url: str | None) -> Store:
+    """Build the store for a `[store] url` (or None → the default SQLite file).
+
+    * ``None`` / unset → ``SqliteStore()`` at the XDG path ($PUNCTUAL_DB wins)
+    * ``sqlite://<path>`` — the path is taken verbatim after the ``//``:
+      ``sqlite:///var/lib/punctual.db`` (absolute), ``sqlite://punctual.db``
+      (relative), ``sqlite://:memory:``
+    * ``postgresql://user:pw@host:5432/dbname`` (needs the ``[postgres]`` extra)
+
+    $PUNCTUAL_STORE_URL overrides the argument — handy for tests / one-offs.
+    """
+    url = os.environ.get("PUNCTUAL_STORE_URL") or url
+    if not url:
+        return SqliteStore()
+    scheme = urlsplit(url).scheme
+    if scheme == "sqlite":
+        return SqliteStore(url[len("sqlite://") :])
+    if scheme in ("postgres", "postgresql"):
+        return PostgresStore(url)
+    raise ValueError(f"unsupported store url scheme {scheme!r}")
 
 
 class Store(Protocol):
@@ -207,38 +229,71 @@ class Store(Protocol):
     def run_dir(self, run_id: int) -> Path:
         """Per-run scratch dir path (holds the exit sentinel)."""
 
+    def close(self) -> None: ...
 
-class SqliteStore:
-    def __init__(self, path: str | Path | None = None):
-        self.path = Path(path) if path else default_db_path()
-        if str(self.path) != ":memory:":
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.execute("PRAGMA foreign_keys=ON")
-        _migrate(self._db)
-        self._db.executescript(SCHEMA)
-        self.state_dir = self.path.parent if str(self.path) != ":memory:" else None
 
-    # --- the exactly-once boundary -----------------------------------------
+class _BaseStore:
+    """Every query, once. Subclasses supply the connection and the four spots
+    where the dialects differ (`_exec`, `_executescript`, schema-version and
+    column introspection)."""
+
+    _PK = "INTEGER PRIMARY KEY"
+    state_dir: Path | None = None
+
+    # --- dialect hooks (overridden per backend) --------------------------
+    def _exec(self, sql: str, params: Sequence[Any] = ()) -> _Cursor:
+        raise NotImplementedError
+
+    def _executescript(self, sql: str) -> None:
+        raise NotImplementedError
+
+    def _schema_version(self) -> int:
+        raise NotImplementedError
+
+    def _set_schema_version(self, version: int) -> None:
+        raise NotImplementedError
+
+    def _existing_tables(self) -> set[str]:
+        raise NotImplementedError
+
+    def _existing_columns(self, table: str) -> set[str]:
+        raise NotImplementedError
+
+    # --- one-time setup -------------------------------------------------
+    def _init_schema(self) -> None:
+        self._migrate()
+        self._executescript(SCHEMA.format(pk=self._PK))
+
+    def _migrate(self) -> None:
+        """Runs *before* the SCHEMA script, so an index that references a new
+        column sees an already-upgraded table. A fresh DB has no tables yet —
+        nothing to alter, SCHEMA builds it complete."""
+        if self._schema_version() >= SCHEMA_VERSION:
+            return
+        tables = self._existing_tables()
+        for table, columns in _ADDED_COLUMNS.items():
+            if table not in tables:
+                continue
+            have = self._existing_columns(table)
+            for name, decl in columns.items():
+                if name not in have:
+                    self._exec(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        self._set_schema_version(SCHEMA_VERSION)
+
+    # --- the exactly-once boundary -------------------------------------
     def claim(self, job: str, scheduled_for: datetime, by: str, attempt: int = 1) -> Run | None:
         now = _utc(datetime.now(UTC))
-        cur = self._db.execute(
-            "INSERT OR IGNORE INTO runs (job, scheduled_for, state, attempt, claimed_by, "
-            "heartbeat_at, created_at) VALUES (?,?,?,?,?,?,?)",
+        row = self._exec(
+            "INSERT INTO runs (job, scheduled_for, state, attempt, claimed_by, "
+            "heartbeat_at, created_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (job, scheduled_for, attempt) DO NOTHING RETURNING *",
             (job, _utc(scheduled_for), RunState.CLAIMED.value, attempt, by, now, now),
-        )
-        if cur.rowcount == 0:
-            return None  # already claimed by someone (or a prior attempt row exists)
-        return self._row_to_run(
-            self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
-        )
+        ).fetchone()
+        return self._row_to_run(row) if row else None
 
-    # --- bookkeeping ------------------------------------------------------
+    # --- bookkeeping --------------------------------------------------
     def mark(self, run: Run) -> None:
-        self._db.execute(
+        self._exec(
             "UPDATE runs SET state=?, started_at=?, finished_at=?, exit_code=?, "
             "heartbeat_at=?, pid=?, pid_start_time=?, stdout_tail=?, stderr_tail=?, "
             "not_before=?, note=? WHERE id=?",
@@ -259,29 +314,29 @@ class SqliteStore:
         )
 
     def heartbeat(self, run_id: int) -> None:
-        self._db.execute(
+        self._exec(
             "UPDATE runs SET heartbeat_at=? WHERE id=?",
             (_utc(datetime.now(UTC)), run_id),
         )
 
     def open_runs(self) -> list[Run]:
-        rows = self._db.execute("SELECT * FROM runs WHERE finished_at IS NULL").fetchall()
+        rows = self._exec("SELECT * FROM runs WHERE finished_at IS NULL").fetchall()
         return [self._row_to_run(r) for r in rows]
 
     def last_fire(self, job: str) -> datetime | None:
-        row = self._db.execute("SELECT last_fire FROM job_clock WHERE job=?", (job,)).fetchone()
+        row = self._exec("SELECT last_fire FROM job_clock WHERE job=?", (job,)).fetchone()
         return _parse(row["last_fire"]) if row else None
 
     def set_last_fire(self, job: str, when: datetime) -> None:
-        self._db.execute(
+        self._exec(
             "INSERT INTO job_clock (job, last_fire) VALUES (?,?) "
             "ON CONFLICT(job) DO UPDATE SET last_fire=excluded.last_fire",
             (job, _utc(when)),
         )
 
-    # --- per-job state / quarantine (M2 slice 2) -----------------------
+    # --- per-job state / quarantine (M2 slice 2) --------------------
     def job_state(self, job: str) -> JobState:
-        row = self._db.execute("SELECT * FROM job_clock WHERE job=?", (job,)).fetchone()
+        row = self._exec("SELECT * FROM job_clock WHERE job=?", (job,)).fetchone()
         if row is None:
             return JobState(job=job)
         return JobState(
@@ -295,7 +350,7 @@ class SqliteStore:
         )
 
     def save_job_state(self, s: JobState) -> None:
-        self._db.execute(
+        self._exec(
             "INSERT INTO job_clock "
             "(job, last_fire, consecutive_failures, quarantined_at, quarantine_reason, "
             " skipped_quarantined, resume_requested) "
@@ -319,7 +374,7 @@ class SqliteStore:
         )
 
     def request_resume(self, job: str) -> None:
-        self._db.execute(
+        self._exec(
             "INSERT INTO job_clock (job, last_fire, resume_requested) VALUES (?,?,1) "
             "ON CONFLICT(job) DO UPDATE SET resume_requested=1",
             (job, _utc(datetime.now(UTC))),
@@ -327,67 +382,62 @@ class SqliteStore:
 
     def history(self, job: str | None = None, limit: int = 50) -> list[Run]:
         if job:
-            rows = self._db.execute(
+            rows = self._exec(
                 "SELECT * FROM runs WHERE job=? ORDER BY scheduled_for DESC, attempt DESC LIMIT ?",
                 (job, limit),
             ).fetchall()
         else:
-            rows = self._db.execute(
-                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            rows = self._exec("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [self._row_to_run(r) for r in rows]
 
     def get_run(self, run_id: int) -> Run | None:
-        row = self._db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        row = self._exec("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         return self._row_to_run(row) if row else None
 
     def attempts_for(self, job: str, scheduled_for: datetime) -> list[Run]:
         """Every attempt row for one fire, oldest attempt first."""
-        rows = self._db.execute(
+        rows = self._exec(
             "SELECT * FROM runs WHERE job=? AND scheduled_for=? ORDER BY attempt",
             (job, _utc(scheduled_for)),
         ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
     def pending_retry(self, job: str) -> Run | None:
-        row = self._db.execute(
+        row = self._exec(
             "SELECT * FROM runs WHERE job=? AND state='retrying' ORDER BY not_before LIMIT 1",
             (job,),
         ).fetchone()
         return self._row_to_run(row) if row else None
 
-    # --- dependencies (M4) --------------------------------------------
+    # --- dependencies (M4) ------------------------------------------
     def last_run(self, job: str) -> Run | None:
-        row = self._db.execute(
+        row = self._exec(
             "SELECT * FROM runs WHERE job=? ORDER BY scheduled_for DESC, attempt DESC LIMIT 1",
             (job,),
         ).fetchone()
         return self._row_to_run(row) if row else None
 
     def last_success_fire(self, job: str) -> datetime | None:
-        row = self._db.execute(
+        row = self._exec(
             "SELECT MAX(scheduled_for) t FROM runs WHERE job=? AND state='succeeded'", (job,)
         ).fetchone()
         return _parse(row["t"]) if row and row["t"] else None
 
     def record_skip(self, job: str, scheduled_for: datetime, by: str, note: str) -> Run | None:
         now = _utc(datetime.now(UTC))
-        cur = self._db.execute(
-            "INSERT OR IGNORE INTO runs (job, scheduled_for, state, claimed_by, "
-            "finished_at, note, created_at) VALUES (?,?,?,?,?,?,?)",
+        row = self._exec(
+            "INSERT INTO runs (job, scheduled_for, state, claimed_by, finished_at, note, "
+            "created_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (job, scheduled_for, attempt) DO NOTHING RETURNING *",
             (job, _utc(scheduled_for), RunState.SKIPPED.value, by, now, note, now),
-        )
-        if cur.rowcount == 0:
-            return None
-        return self._row_to_run(
-            self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
-        )
+        ).fetchone()
+        return self._row_to_run(row) if row else None
 
-    # --- cluster leases (M5) ----------------------------------------
+    # --- cluster leases (M5) --------------------------------------
     def acquire_lease(self, resource: str, holder: str, ttl: timedelta) -> Lease | None:
         now = datetime.now(UTC)
         exp = _utc(now + ttl)
-        cur = self._db.execute(
+        cur = self._exec(
             "INSERT INTO leases (resource, holder, fence, expires_at) VALUES (?,?,1,?) "
             "ON CONFLICT(resource) DO UPDATE SET "
             "  holder=excluded.holder, fence=leases.fence + 1, expires_at=excluded.expires_at "
@@ -396,23 +446,23 @@ class SqliteStore:
         )
         if cur.rowcount == 0:
             return None  # someone else holds a live lease
-        row = self._db.execute(
+        row = self._exec(
             "SELECT * FROM leases WHERE resource=? AND holder=?", (resource, holder)
         ).fetchone()
         return Lease(resource, holder, row["fence"], _parse_req(row["expires_at"])) if row else None
 
     def renew_lease(self, resource: str, holder: str, fence: int, ttl: timedelta) -> bool:
-        cur = self._db.execute(
+        cur = self._exec(
             "UPDATE leases SET expires_at=? WHERE resource=? AND holder=? AND fence=?",
             (_utc(datetime.now(UTC) + ttl), resource, holder, fence),
         )
         return cur.rowcount > 0
 
     def release_lease(self, resource: str, holder: str) -> None:
-        self._db.execute("DELETE FROM leases WHERE resource=? AND holder=?", (resource, holder))
+        self._exec("DELETE FROM leases WHERE resource=? AND holder=?", (resource, holder))
 
     def lease_holder(self, resource: str) -> str | None:
-        row = self._db.execute(
+        row = self._exec(
             "SELECT holder FROM leases WHERE resource=? AND expires_at > ?",
             (resource, _utc(datetime.now(UTC))),
         ).fetchone()
@@ -420,51 +470,48 @@ class SqliteStore:
 
     def metrics_snapshot(self) -> MetricsSnapshot:
         snap = MetricsSnapshot()
-        for r in self._db.execute(
+        for r in self._exec(
             "SELECT job, state, COUNT(*) n FROM runs WHERE finished_at IS NOT NULL "
             "GROUP BY job, state"
-        ):
+        ).fetchall():
             snap.run_counts[(r["job"], r["state"])] = r["n"]
-        for r in self._db.execute(
+        for r in self._exec(
             "SELECT job, MAX(finished_at) t FROM runs WHERE state='succeeded' GROUP BY job"
-        ):
+        ).fetchall():
             if r["t"]:
                 snap.last_success[r["job"]] = _parse_req(r["t"])
-        for r in self._db.execute(
+        for r in self._exec(
             "SELECT job, started_at, finished_at FROM runs "
             "WHERE started_at IS NOT NULL AND finished_at IS NOT NULL"
-        ):
+        ).fetchall():
             secs = (_parse_req(r["finished_at"]) - _parse_req(r["started_at"])).total_seconds()
             snap.durations.append((r["job"], max(0.0, secs)))
-        row = self._db.execute("SELECT COUNT(*) n FROM runs WHERE state='retrying'").fetchone()
-        snap.pending_retries = row["n"]
+        row = self._exec("SELECT COUNT(*) n FROM runs WHERE state='retrying'").fetchone()
+        snap.pending_retries = row["n"] if row else 0
         return snap
 
-    # --- retries (M2) ---------------------------------------------------
+    # --- retries (M2) ---------------------------------------------
     def schedule_retry(
         self, job: str, scheduled_for: datetime, attempt: int, not_before: datetime, by: str
     ) -> Run | None:
         now = _utc(datetime.now(UTC))
-        cur = self._db.execute(
-            "INSERT OR IGNORE INTO runs (job, scheduled_for, state, attempt, claimed_by, "
-            "not_before, created_at) VALUES (?,?,?,?,?,?,?)",
+        row = self._exec(
+            "INSERT INTO runs (job, scheduled_for, state, attempt, claimed_by, not_before, "
+            "created_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (job, scheduled_for, attempt) DO NOTHING RETURNING *",
             (job, _utc(scheduled_for), RunState.RETRYING.value, attempt, by, _utc(not_before), now),
-        )
-        if cur.rowcount == 0:
-            return None
-        return self._row_to_run(
-            self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
-        )
+        ).fetchone()
+        return self._row_to_run(row) if row else None
 
     def due_retries(self, now: datetime) -> list[Run]:
-        rows = self._db.execute(
+        rows = self._exec(
             "SELECT * FROM runs WHERE state = 'retrying' AND not_before <= ? ORDER BY not_before",
             (_utc(now),),
         ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
     def next_retry_at(self) -> datetime | None:
-        row = self._db.execute(
+        row = self._exec(
             "SELECT MIN(not_before) AS t FROM runs WHERE state = 'retrying'"
         ).fetchone()
         return _parse(row["t"]) if row and row["t"] else None
@@ -475,10 +522,10 @@ class SqliteStore:
         return base / "runs" / str(run_id)
 
     def close(self) -> None:
-        self._db.close()
+        raise NotImplementedError
 
     @staticmethod
-    def _row_to_run(r: sqlite3.Row) -> Run:
+    def _row_to_run(r: Mapping[str, Any]) -> Run:
         return Run(
             id=r["id"],
             job=r["job"],
@@ -498,3 +545,99 @@ class SqliteStore:
             created_at=_parse(r["created_at"]),
             note=r["note"],
         )
+
+
+class SqliteStore(_BaseStore):
+    _PK = "INTEGER PRIMARY KEY"
+
+    def __init__(self, path: str | Path | None = None):
+        self.path = Path(path) if path else default_db_path()
+        if str(self.path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
+        self._db.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+        self.state_dir = self.path.parent if str(self.path) != ":memory:" else None
+
+    def _exec(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
+        return self._db.execute(sql, params)
+
+    def _executescript(self, sql: str) -> None:
+        self._db.executescript(sql)
+
+    def _schema_version(self) -> int:
+        (version,) = self._db.execute("PRAGMA user_version").fetchone()
+        return int(version)
+
+    def _set_schema_version(self, version: int) -> None:
+        self._db.execute(f"PRAGMA user_version = {int(version)}")
+
+    def _existing_tables(self) -> set[str]:
+        return {
+            r["name"] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+
+    def _existing_columns(self, table: str) -> set[str]:
+        return {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
+
+    def close(self) -> None:
+        self._db.close()
+
+
+class PostgresStore(_BaseStore):
+    """Shared store for a clustered deployment (M5). ``pip install
+    punctual-scheduler[postgres]``. Schema and queries are the SQLite ones; only
+    the parameter token (``%s``), the identity column, and the version table
+    differ."""
+
+    _PK = "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"
+
+    def __init__(self, dsn: str):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ModuleNotFoundError as e:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "PostgresStore needs psycopg — `pip install punctual-scheduler[postgres]`"
+            ) from e
+        self.dsn = dsn
+        self._conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+        self._init_schema()
+
+    @staticmethod
+    def _q(sql: str) -> str:
+        # No query here contains a literal '?' or '%', so this is unambiguous.
+        return sql.replace("?", "%s")
+
+    def _exec(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        return self._conn.execute(self._q(sql), tuple(params))
+
+    def _executescript(self, sql: str) -> None:
+        self._conn.execute(sql)
+
+    def _schema_version(self) -> int:
+        self._conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")
+        row = self._conn.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+        return int(row["version"]) if row else 0
+
+    def _set_schema_version(self, version: int) -> None:
+        self._conn.execute("DELETE FROM schema_meta")
+        self._conn.execute("INSERT INTO schema_meta (version) VALUES (%s)", (version,))
+
+    def _existing_tables(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        ).fetchall()
+        return {r["tablename"] for r in rows}
+
+    def _existing_columns(self, table: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table,)
+        ).fetchall()
+        return {r["column_name"] for r in rows}
+
+    def close(self) -> None:
+        self._conn.close()

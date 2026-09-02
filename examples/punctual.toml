@@ -1,5 +1,10 @@
 # Example config. `punctual validate -c examples/punctual.toml` to check it.
 
+# [store]
+# url = "postgresql://punctual:secret@db.internal/punctual"  # shared store for --cluster
+#                                                            # (needs the [postgres] extra);
+#                                                            # omit for the default SQLite file
+
 [observability]
 metrics_port = 9095          # serve GET /metrics + /healthz on 127.0.0.1:9095
 

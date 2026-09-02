@@ -22,6 +22,7 @@ from punctual.models import (
     ObservabilityConfig,
     OnLost,
     RetryPolicy,
+    StoreConfig,
     UpstreamFailure,
 )
 
@@ -174,6 +175,20 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
 
 
 _OBSERVABILITY_KEYS = {"metrics_addr", "metrics_port"}
+_STORE_KEYS = {"url"}
+
+
+def _store(raw: dict[str, Any]) -> StoreConfig:
+    unknown = set(raw) - _STORE_KEYS
+    if unknown:
+        raise ConfigError(f"[store]: unknown keys {sorted(unknown)}")
+    cfg = StoreConfig()
+    if "url" in raw:
+        url = str(raw["url"])
+        if not url.startswith(("sqlite:", "postgres:", "postgresql:")):
+            raise ConfigError(f"[store]: unsupported url scheme in {url!r}")
+        cfg.url = url
+    return cfg
 
 
 def _observability(raw: dict[str, Any]) -> ObservabilityConfig:
@@ -200,7 +215,7 @@ def load_config(path: str | Path) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}") from e
 
-    unknown_top = set(doc) - {"job", "observability"}
+    unknown_top = set(doc) - {"job", "observability", "store"}
     if unknown_top:
         raise ConfigError(f"{path}: unknown top-level table(s) {sorted(unknown_top)}")
 
@@ -216,7 +231,11 @@ def load_config(path: str | Path) -> Config:
             if dep not in names:
                 raise ConfigError(f"job {j.name!r}: after references unknown job {dep!r}")
     _reject_cycles(jobs)
-    return Config(jobs=jobs, observability=_observability(doc.get("observability", {})))
+    return Config(
+        jobs=jobs,
+        observability=_observability(doc.get("observability", {})),
+        store=_store(doc.get("store", {})),
+    )
 
 
 def _reject_cycles(jobs: list[Job]) -> None:

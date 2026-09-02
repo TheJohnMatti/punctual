@@ -70,3 +70,32 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev]"
       - run: pytest -q --cov --cov-report=term-missing
+
+  # The Postgres backend (M5): the same store + cluster tests, against a real
+  # server. tests/conftest.py's `store` fixture makes a throwaway DB per test.
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # hatch-vcs reads the version from git history + tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest -q tests/test_store.py tests/test_cluster.py
+        env:
+          PUNCTUAL_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
