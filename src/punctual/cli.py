@@ -305,8 +305,13 @@ def _render_run(r: dict[str, Any]) -> None:
     show_default=True,
     help="json = one event object per line",
 )
+@click.option(
+    "--cluster",
+    is_flag=True,
+    help="take a shared lease before scheduling; hot-standby when another daemon holds it",
+)
 @click.pass_context
-def run(ctx: click.Context, verbose: bool, log_format: str) -> None:
+def run(ctx: click.Context, verbose: bool, log_format: str, cluster: bool) -> None:
     """Start the scheduler daemon (run this under systemd / launchd)."""
     from punctual import logs
 
@@ -318,7 +323,8 @@ def run(ctx: click.Context, verbose: bool, log_format: str) -> None:
     where = (
         f" · metrics :{cfg.observability.metrics_port}" if cfg.observability.metrics_port else ""
     )
-    click.secho(f"punctual: {n} job(s) armed · state at {store.path}{where}", fg="green")
+    role = " · cluster" if cluster else ""
+    click.secho(f"punctual: {n} job(s) armed · state at {store.path}{where}{role}", fg="green")
     try:
         asyncio.run(
             serve(
@@ -327,6 +333,7 @@ def run(ctx: click.Context, verbose: bool, log_format: str) -> None:
                 _instance_id(),
                 config_reload=lambda: load_config(path).jobs,
                 observability=cfg.observability,
+                cluster=cluster,
             )
         )
     finally:
@@ -348,7 +355,8 @@ def ping() -> None:
     """Check the running daemon is alive."""
     r = _talk("ping")
     click.echo(
-        f"pid {r['pid']}, {r['jobs']} job(s), {r['in_flight']} in flight, up {r['uptime_s']}s"
+        f"{r.get('role', 'solo')} · pid {r['pid']}, {r['jobs']} job(s), "
+        f"{r['in_flight']} in flight, up {r['uptime_s']}s"
     )
 
 

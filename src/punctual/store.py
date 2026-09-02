@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -30,8 +30,20 @@ class MetricsSnapshot:
     pending_retries: int = 0
 
 
+@dataclass(slots=True)
+class Lease:
+    """A held lease on a named resource (M5). `fence` is a monotonic token bumped
+    on every acquisition — stamp it on side-effects so a zombie ex-leader can't
+    act after the lease has moved on."""
+
+    resource: str
+    holder: str
+    fence: int
+    expires_at: datetime
+
+
 # Bump when SCHEMA changes; add the matching step to _migrate().
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -57,6 +69,15 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_job_sched ON runs (job, scheduled_for);
 CREATE INDEX IF NOT EXISTS runs_open      ON runs (state) WHERE finished_at IS NULL;
 CREATE INDEX IF NOT EXISTS runs_retry     ON runs (not_before) WHERE state = 'retrying';
+
+-- M5: cluster leases. One row per resource; whoever's `expires_at` is in the
+-- future holds it. `fence` bumps on every (re)acquisition.
+CREATE TABLE IF NOT EXISTS leases (
+    resource   TEXT PRIMARY KEY,
+    holder     TEXT NOT NULL,
+    fence      INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL
+);
 
 -- Per-job state that outlives any single run: the catch-up baseline (O3) and
 -- the quarantine circuit-breaker (M2 slice 2).
@@ -152,6 +173,16 @@ class Store(Protocol):
     def last_run(self, job: str) -> Run | None: ...
     def last_success_fire(self, job: str) -> datetime | None: ...
     def record_skip(self, job: str, scheduled_for: datetime, by: str, note: str) -> Run | None: ...
+
+    def acquire_lease(self, resource: str, holder: str, ttl: timedelta) -> Lease | None:
+        """Take `resource` if it's free or expired, bumping the fence. None if
+        someone else holds a live lease."""
+
+    def renew_lease(self, resource: str, holder: str, fence: int, ttl: timedelta) -> bool:
+        """Extend our lease. False if we no longer hold it at this fence."""
+
+    def release_lease(self, resource: str, holder: str) -> None: ...
+    def lease_holder(self, resource: str) -> str | None: ...
 
     def job_state(self, job: str) -> JobState:
         """The per-job state row (defaults if the job has no row yet)."""
@@ -351,6 +382,41 @@ class SqliteStore:
         return self._row_to_run(
             self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
         )
+
+    # --- cluster leases (M5) ----------------------------------------
+    def acquire_lease(self, resource: str, holder: str, ttl: timedelta) -> Lease | None:
+        now = datetime.now(UTC)
+        exp = _utc(now + ttl)
+        cur = self._db.execute(
+            "INSERT INTO leases (resource, holder, fence, expires_at) VALUES (?,?,1,?) "
+            "ON CONFLICT(resource) DO UPDATE SET "
+            "  holder=excluded.holder, fence=leases.fence + 1, expires_at=excluded.expires_at "
+            "WHERE leases.expires_at < ? OR leases.holder = ?",
+            (resource, holder, exp, _utc(now), holder),
+        )
+        if cur.rowcount == 0:
+            return None  # someone else holds a live lease
+        row = self._db.execute(
+            "SELECT * FROM leases WHERE resource=? AND holder=?", (resource, holder)
+        ).fetchone()
+        return Lease(resource, holder, row["fence"], _parse_req(row["expires_at"])) if row else None
+
+    def renew_lease(self, resource: str, holder: str, fence: int, ttl: timedelta) -> bool:
+        cur = self._db.execute(
+            "UPDATE leases SET expires_at=? WHERE resource=? AND holder=? AND fence=?",
+            (_utc(datetime.now(UTC) + ttl), resource, holder, fence),
+        )
+        return cur.rowcount > 0
+
+    def release_lease(self, resource: str, holder: str) -> None:
+        self._db.execute("DELETE FROM leases WHERE resource=? AND holder=?", (resource, holder))
+
+    def lease_holder(self, resource: str) -> str | None:
+        row = self._db.execute(
+            "SELECT holder FROM leases WHERE resource=? AND expires_at > ?",
+            (resource, _utc(datetime.now(UTC))),
+        ).fetchone()
+        return row["holder"] if row else None
 
     def metrics_snapshot(self) -> MetricsSnapshot:
         snap = MetricsSnapshot()
