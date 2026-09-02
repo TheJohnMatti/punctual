@@ -157,6 +157,7 @@ def explain_run(run: Run, store: Store) -> dict[str, Any]:
             {"attempt": s.attempt, "state": s.state.value, "exit_code": s.exit_code} for s in priors
         ],
         "what_happened_next": _what_next(run, siblings, store),
+        "steps": [name for name, _ in store.steps_for(run.job, run.scheduled_for)] or None,
         "stdout_tail": run.stdout_tail,
         "stderr_tail": run.stderr_tail,
     }

@@ -16,6 +16,7 @@ load-bearing operation is :meth:`Store.claim` — the exactly-once boundary
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -61,7 +62,7 @@ class Lease:
 
 
 # Bump when SCHEMA changes; add the matching step to _BaseStore._migrate().
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # `{pk}` is the autoincrement primary-key declaration — the one spot the two
 # backends' DDL diverges (see _PK on each store).
@@ -97,6 +98,18 @@ CREATE TABLE IF NOT EXISTS leases (
     holder     TEXT NOT NULL,
     fence      INTEGER NOT NULL DEFAULT 0,
     expires_at TEXT NOT NULL
+);
+
+-- M6: durable step checkpoints inside a job body. One row per completed
+-- step(name, fn); a retry of the same fire reads the cached JSON result
+-- instead of re-running the step.
+CREATE TABLE IF NOT EXISTS steps (
+    job           TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    result        TEXT NOT NULL,   -- JSON
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (job, scheduled_for, name)
 );
 
 -- Per-job state that outlives any single run: the catch-up baseline (O3) and
@@ -228,6 +241,19 @@ class Store(Protocol):
 
     def run_dir(self, run_id: int) -> Path:
         """Per-run scratch dir path (holds the exit sentinel)."""
+
+    def get_step(self, job: str, scheduled_for: datetime, name: str) -> tuple[bool, Any]:
+        """`(True, cached_result)` if this step of this fire already completed,
+        else `(False, None)`. Result is the JSON-decoded value (M6)."""
+
+    def record_step(self, job: str, scheduled_for: datetime, name: str, result_json: str) -> None:
+        """Store a completed step's JSON result (idempotent per fire+name)."""
+
+    def steps_for(self, job: str, scheduled_for: datetime) -> list[tuple[str, Any]]:
+        """`(name, result)` for every completed step of a fire, in order."""
+
+    def child_env(self) -> dict[str, str]:
+        """Env a spawned job needs to reconnect to this store (for `step()`)."""
 
     def close(self) -> None: ...
 
@@ -521,6 +547,32 @@ class _BaseStore:
         base = self.state_dir or Path(tempfile.gettempdir()) / "punctual"
         return base / "runs" / str(run_id)
 
+    # --- durable steps (M6) -------------------------------------
+    def get_step(self, job: str, scheduled_for: datetime, name: str) -> tuple[bool, Any]:
+        row = self._exec(
+            "SELECT result FROM steps WHERE job=? AND scheduled_for=? AND name=?",
+            (job, _utc(scheduled_for), name),
+        ).fetchone()
+        return (True, json.loads(row["result"])) if row else (False, None)
+
+    def record_step(self, job: str, scheduled_for: datetime, name: str, result_json: str) -> None:
+        self._exec(
+            "INSERT INTO steps (job, scheduled_for, name, result, created_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT (job, scheduled_for, name) DO NOTHING",
+            (job, _utc(scheduled_for), name, result_json, _utc(datetime.now(UTC))),
+        )
+
+    def steps_for(self, job: str, scheduled_for: datetime) -> list[tuple[str, Any]]:
+        rows = self._exec(
+            "SELECT name, result FROM steps WHERE job=? AND scheduled_for=? "
+            "ORDER BY created_at, name",
+            (job, _utc(scheduled_for)),
+        ).fetchall()
+        return [(r["name"], json.loads(r["result"])) for r in rows]
+
+    def child_env(self) -> dict[str, str]:
+        return {}
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -583,6 +635,9 @@ class SqliteStore(_BaseStore):
     def _existing_columns(self, table: str) -> set[str]:
         return {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
 
+    def child_env(self) -> dict[str, str]:
+        return {} if str(self.path) == ":memory:" else {"PUNCTUAL_DB": str(self.path)}
+
     def close(self) -> None:
         self._db.close()
 
@@ -638,6 +693,9 @@ class PostgresStore(_BaseStore):
             "SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table,)
         ).fetchall()
         return {r["column_name"] for r in rows}
+
+    def child_env(self) -> dict[str, str]:
+        return {"PUNCTUAL_STORE_URL": self.dsn}
 
     def close(self) -> None:
         self._conn.close()

@@ -740,7 +740,12 @@ class Scheduler:
                 self.store.mark(run)
 
             outcome = await execute(
-                job, run, timeout=job.timeout, on_spawn=_record_pid, run_dir=run_dir
+                job,
+                run,
+                timeout=job.timeout,
+                on_spawn=_record_pid,
+                run_dir=run_dir,
+                env=self.store.child_env(),
             )
 
             run.finished_at = datetime.now(UTC)

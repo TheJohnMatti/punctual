@@ -307,6 +307,8 @@ def _render_run(r: dict[str, Any]) -> None:
         pc = "" if p["exit_code"] is None else f" exit {p['exit_code']}"
         click.echo(f"    attempt {p['attempt']}: {p['state']}{pc}")
     click.echo(f"  what next      {r['what_happened_next']}")
+    if r.get("steps"):
+        click.echo(f"  steps done     {', '.join(r['steps'])}")
     for label, text in (("stdout", r["stdout_tail"]), ("stderr", r["stderr_tail"])):
         if text:
             snip = text if len(text) <= 500 else text[-500:] + " …(truncated)"
