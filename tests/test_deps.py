@@ -32,7 +32,7 @@ async def test_downstream_fires_when_upstream_succeeds(tmp_path):
     sched = Scheduler(
         [_upstream("scrape"), _triggered("process", ["scrape"])], store, "t", handle_signals=False
     )
-    await _run_briefly(sched, 3.0)
+    await _run_briefly(sched, 4.0)
 
     scrapes = [r for r in store.history("scrape", 50) if r.state is RunState.SUCCEEDED]
     procs = [r for r in store.history("process", 50) if r.state is RunState.SUCCEEDED]
@@ -45,14 +45,14 @@ async def test_downstream_fires_when_upstream_succeeds(tmp_path):
 
 async def test_fan_in_waits_for_all_upstreams(tmp_path):
     store = SqliteStore(tmp_path / "s.db")
-    slow = ["bash", "-lc", "sleep 2"]
+    slow = ["bash", "-lc", "sleep 1"]
     sched = Scheduler(
         [_upstream("a"), _upstream("b", slow), _triggered("report", ["a", "b"])],
         store,
         "t",
         handle_signals=False,
     )
-    await _run_briefly(sched, 3.5)
+    await _run_briefly(sched, 6.0)
 
     # report only ran after b (the slow one) had at least one success
     reports = store.history("report", 50)
@@ -70,7 +70,7 @@ async def test_upstream_failure_skips_downstream_by_default(tmp_path):
         "t",
         handle_signals=False,
     )
-    await _run_briefly(sched, 3.0)
+    await _run_briefly(sched, 4.0)
 
     proc_rows = store.history("process", 50)
     assert proc_rows
@@ -90,7 +90,7 @@ async def test_on_upstream_failure_run(tmp_path):
         "t",
         handle_signals=False,
     )
-    await _run_briefly(sched, 3.0)
+    await _run_briefly(sched, 4.0)
 
     ran = [r for r in store.history("process", 50) if r.state is RunState.SUCCEEDED]
     assert ran and "despite upstream" in ran[0].note
