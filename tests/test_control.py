@@ -99,6 +99,26 @@ async def test_reload_adds_and_removes_jobs(sock, tmp_path):
     store.close()
 
 
+async def test_trigger_over_the_socket(sock, tmp_path):
+    store = SqliteStore(tmp_path / "d.db")
+    sched, task = await _serve([_job("a")], store)  # yearly schedule
+    r = await _call("trigger", job="a")
+    assert r["ok"] and r["job"] == "a"
+    await asyncio.sleep(1.0)
+    await _shutdown(sched, task)
+    assert store.history("a") and store.history("a")[0].state.value == "succeeded"
+    store.close()
+
+
+async def test_trigger_unknown_job(sock, tmp_path):
+    store = SqliteStore(tmp_path / "d.db")
+    sched, task = await _serve([_job("a")], store)
+    r = await _call("trigger", job="ghost")
+    assert not r["ok"] and "no job" in r["error"]
+    await _shutdown(sched, task)
+    store.close()
+
+
 async def test_metrics_and_healthz_over_the_socket(sock, tmp_path):
     store = SqliteStore(tmp_path / "d.db")
     sched, task = await _serve([_job("a")], store)

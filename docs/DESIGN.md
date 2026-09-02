@@ -294,6 +294,8 @@ exit). One line of JSON per request, one per reply (`punctual/control.py`).
   *reported* (`changed`, `note: restart to apply`) but the old definition keeps
   running — no half-applied schedule/retry changes. Bad config → `{ok: false}`,
   daemon keeps running the old one.
+- `trigger {job}` → queue an ad-hoc run (M4 slice 3): `scheduled_for = now`,
+  `note = "manual trigger"`, bypasses schedule / `after` / quarantine.
 
 `punctual drain` / `stop [--kill] [--timeout]` / `reload` / `ping` are the
 client; `stop` polls `ping` until the socket goes away. `NotRunning` is raised
@@ -411,7 +413,10 @@ quarantined / degraded job succeeds again — M3 slice 1).
     and `feeds: <downstreams>`; `plan` annotates triggered jobs with what
     they're waiting on; `tui` detail panel likewise. New `punctual graph`
     (`--format text` tree / `dot` for graphviz).
-  - *slice 3* — `on_upstream_failure = "wait"` timeout; partial fan-in;
-    re-trigger after a downstream config change.
+  - *slice 3 ✅* — `wait_timeout` (per-job duration): a `WAIT` downstream falls
+    back to SKIP once it's been blocked that long (`_blocked_since`, in-memory).
+    `punctual trigger <job>` — a control command that queues an ad-hoc run
+    (`scheduled_for = now`, `note = "manual trigger"`), ignoring schedule /
+    `after` / quarantine. **⇒ M4 done.**
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
 - **M6 — durable steps**: `@punctual.step` in-process checkpointing.

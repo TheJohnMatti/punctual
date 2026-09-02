@@ -2,7 +2,7 @@
 
 import asyncio
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from punctual.models import Job, RunState, UpstreamFailure
 from punctual.scheduler import Scheduler
@@ -94,6 +94,49 @@ async def test_on_upstream_failure_run(tmp_path):
 
     ran = [r for r in store.history("process", 50) if r.state is RunState.SUCCEEDED]
     assert ran and "despite upstream" in ran[0].note
+    store.close()
+
+
+async def test_wait_falls_back_to_skip_after_wait_timeout(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    down = _triggered(
+        "process",
+        ["scrape"],
+        on_upstream_failure=UpstreamFailure.WAIT,
+        wait_timeout=timedelta(seconds=1),
+    )
+    sched = Scheduler([_upstream("scrape", FAIL), down], store, "t", handle_signals=False)
+    await _run_briefly(sched, 4.0)
+
+    proc_rows = store.history("process", 50)
+    assert proc_rows and proc_rows[0].state is RunState.SKIPPED  # gave up after 1s
+
+
+async def test_wait_holds_when_no_timeout(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    down = _triggered("process", ["scrape"], on_upstream_failure=UpstreamFailure.WAIT)
+    sched = Scheduler([_upstream("scrape", FAIL), down], store, "t", handle_signals=False)
+    await _run_briefly(sched, 3.0)
+    assert store.history("process", 50) == []  # still waiting, nothing recorded
+    store.close()
+
+
+async def test_manual_trigger_runs_a_job_ignoring_its_schedule(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    # yearly schedule -> never fires on its own during the test
+    job = Job(name="backup", schedule="0 0 1 1 *", command=OK)
+    sched = Scheduler([job], store, "t", handle_signals=False)
+
+    task = asyncio.create_task(sched.run())
+    await asyncio.sleep(0.5)
+    assert sched.trigger("backup") == {"ok": True, "job": "backup"}
+    await asyncio.sleep(1.0)
+    sched._request_stop()
+    await asyncio.wait_for(task, timeout=10)
+
+    runs = store.history("backup", 50)
+    assert len(runs) == 1 and runs[0].state is RunState.SUCCEEDED
+    assert runs[0].note == "manual trigger"
     store.close()
 
 
