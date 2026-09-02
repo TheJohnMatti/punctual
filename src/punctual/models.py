@@ -168,11 +168,24 @@ class ObservabilityConfig:
 
 
 @dataclass(slots=True)
+class StoreConfig:
+    """The optional ``[store]`` table in punctual.toml (M5).
+
+    ``url`` picks the backend: ``sqlite:///abs/path`` (or unset → the XDG default
+    file) vs ``postgresql://user:pw@host/db``. Postgres is what makes a
+    ``--cluster`` deployment actually shared across hosts.
+    """
+
+    url: str | None = None
+
+
+@dataclass(slots=True)
 class Config:
     """Everything parsed from punctual.toml."""
 
     jobs: list[Job]
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    store: StoreConfig = field(default_factory=StoreConfig)
 
 
 @dataclass(slots=True)

@@ -1,16 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from punctual.models import RunState
-from punctual.store import SqliteStore
+from punctual.store import PostgresStore, SqliteStore, store_from_url
 
-
-@pytest.fixture
-def store(tmp_path):
-    s = SqliteStore(tmp_path / "t.db")
-    yield s
-    s.close()
+# `store` is the parametrized (sqlite + postgres) fixture from conftest.py.
 
 
 def _fire():
@@ -54,3 +49,64 @@ def test_job_clock(store):
     assert store.last_fire("backup") is None
     store.set_last_fire("backup", _fire())
     assert store.last_fire("backup") == _fire()
+
+
+def test_record_skip_is_idempotent_per_fire(store):
+    r = store.record_skip("j", _fire(), by="n", note="upstream x failed")
+    assert r is not None and r.state is RunState.SKIPPED and r.note == "upstream x failed"
+    assert store.record_skip("j", _fire(), by="n", note="again") is None
+
+
+def test_schedule_retry_then_due(store):
+    store.claim("j", _fire(), by="n", attempt=1)
+    nb = datetime(2026, 1, 1, 3, 5, tzinfo=UTC)
+    r = store.schedule_retry("j", _fire(), attempt=2, not_before=nb, by="n")
+    assert r is not None and r.state is RunState.RETRYING
+    assert store.due_retries(nb - timedelta(minutes=1)) == []
+    assert [x.attempt for x in store.due_retries(nb)] == [2]
+    assert store.next_retry_at() == nb
+
+
+def test_lease_roundtrip(store):
+    a = store.acquire_lease("res", "a", timedelta(seconds=30))
+    assert a is not None and a.fence == 1
+    assert store.acquire_lease("res", "b", timedelta(seconds=30)) is None
+    assert store.renew_lease("res", "a", 1, timedelta(seconds=30)) is True
+    store.release_lease("res", "a")
+    assert store.lease_holder("res") is None
+
+
+# --- store_from_url routing (no server needed) ------------------------
+
+
+def test_store_from_url_none_is_default_sqlite(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUNCTUAL_DB", str(tmp_path / "x.db"))
+    monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
+    s = store_from_url(None)
+    assert isinstance(s, SqliteStore) and s.path == tmp_path / "x.db"
+    s.close()
+
+
+def test_store_from_url_sqlite_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
+    s = store_from_url(f"sqlite://{tmp_path / 'y.db'}")
+    assert isinstance(s, SqliteStore) and s.path == tmp_path / "y.db"
+    s.close()
+
+
+def test_store_from_url_postgres_defers_to_postgresstore(monkeypatch):
+    monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
+    seen = {}
+
+    def fake_init(self, dsn):
+        seen["dsn"] = dsn
+
+    monkeypatch.setattr(PostgresStore, "__init__", fake_init)
+    s = store_from_url("postgresql://u@h/db")
+    assert isinstance(s, PostgresStore) and seen["dsn"] == "postgresql://u@h/db"
+
+
+def test_store_from_url_rejects_unknown_scheme(monkeypatch):
+    monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
+    with pytest.raises(ValueError, match="scheme"):
+        store_from_url("mysql://nope")

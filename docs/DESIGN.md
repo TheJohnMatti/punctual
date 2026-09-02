@@ -324,7 +324,7 @@ upstream job names) — enforced at config load, along with cycle rejection
   near-immediate (else within `MAX_SLEEP`). Retries / quarantine / recovery all
   work unchanged on triggered jobs. New `runs.note` column (schema v5).
 
-### O13 — Clustering  *(lease + leader election built — M5 slice 1)*
+### O13 — Clustering  *(built — M5)*
 Run two+ daemons off one shared store for availability. **Exactly one schedules
 at a time** (a lease); the rest are hot standby, ready to take over.
 
@@ -353,8 +353,31 @@ at a time** (a lease); the rest are hot standby, ready to take over.
   trigger a needless handoff.
 - Standby's control socket stays live throughout (its own `$PUNCTUAL_SOCKET`),
   so `ping` / `healthz` / `metrics` work on every node.
-- **M5 slice 2:** a real `PostgresStore` so the shared store isn't a
-  single-host SQLite file — the actual point of clustering.
+
+**The shared store (M5 slice 2).** A cluster on one SQLite file is only as
+available as that host, so clustering needs Postgres.
+
+- **One logic core, two backends.** `_BaseStore` holds every query once;
+  `SqliteStore` and `PostgresStore` supply the connection and the four spots the
+  dialects differ: the parameter token (`?` vs `%s`), the autoincrement column,
+  how the schema version is tracked (`PRAGMA user_version` vs a `schema_meta`
+  row), and column introspection for migrations.
+- **Timestamps stay ISO-8601 UTC text in both** (fixed `+00:00` offset, so
+  lexical order == chronological). No `timestamptz`, no driver datetime
+  adaptation to reason about — `expires_at < ?`, `MAX(scheduled_for)`,
+  `ORDER BY not_before` all just work.
+- **`claim` is `INSERT … ON CONFLICT (job, scheduled_for, attempt) DO NOTHING
+  RETURNING *`** — one statement, no `lastrowid` round-trip, identical on both
+  (SQLite ≥ 3.35). Same for `record_skip` / `schedule_retry`.
+- **Selector:** `[store] url` in punctual.toml (or `$PUNCTUAL_STORE_URL`) —
+  `sqlite://<path>` / `postgresql://…`. Unset → the XDG SQLite file.
+  `pip install punctual-scheduler[postgres]` pulls `psycopg` v3.
+- **Migrations on Postgres are a no-op today** (no legacy PG databases exist) —
+  a fresh DB gets the complete schema. The additive-`ALTER` path is wired for
+  both anyway.
+- **CI:** a `test-postgres` job runs the store + cluster suites against a real
+  `postgres:16` service; the `store` fixture makes a throwaway database per
+  test (xdist-safe).
 
 ### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
 Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
@@ -455,6 +478,8 @@ quarantined / degraded job succeeds again — M3 slice 1).
     `lease_holder` on `Store`; `run --cluster` → lease-based single leader,
     others hot standby; fencing token on `Lease`; `healthz` / `control_status` /
     `trigger` cluster-aware.
-  - *slice 2* — full `PostgresStore` (`psycopg` v3, `[postgres]` extra), a
-    `[store] url` config selector, a CI job running the suite against real PG.
+  - *slice 2 ✅* — `_BaseStore` shared core + `PostgresStore` (`psycopg` v3,
+    `[postgres]` extra); `[store] url` / `$PUNCTUAL_STORE_URL` selector;
+    `claim` → `ON CONFLICT … RETURNING`; `test-postgres` CI job (real
+    `postgres:16`, throwaway DB per test). **⇒ M5 done.**
 - **M6 — durable steps**: `@punctual.step` in-process checkpointing.

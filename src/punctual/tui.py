@@ -20,7 +20,7 @@ from textual.widgets import DataTable, Footer, Header, Static
 from punctual import introspect
 from punctual.config import load_config
 from punctual.models import Job
-from punctual.store import SqliteStore
+from punctual.store import Store, store_from_url
 
 _HEALTH_STYLE = {
     "ok": "green",
@@ -85,11 +85,18 @@ class PunctualTUI(App[None]):
         if self._busy or event.data_table.id != "jobs":
             return
         with contextlib.suppress(Exception):
-            store = SqliteStore()
+            store = self._open_store()
             try:
                 self._fill_detail(store)
             finally:
                 store.close()
+
+    def _open_store(self) -> Store:
+        try:
+            url = load_config(self._config_path).store.url
+        except Exception:
+            url = None
+        return store_from_url(url)
 
     # --- data ---------------------------------------------------------
     def refresh_data(self) -> None:
@@ -99,7 +106,7 @@ class PunctualTUI(App[None]):
             self.detail_text = f"config error: {e}"
             self.query_one("#detail", Static).update(f"[red]{self.detail_text}[/red]")
             return
-        store = SqliteStore()
+        store = self._open_store()
         self._busy = True
         try:
             self._fill_jobs(store)
@@ -120,7 +127,7 @@ class PunctualTUI(App[None]):
             return ordered[jt.cursor_row]
         return ordered[0] if ordered else None
 
-    def _fill_jobs(self, store: SqliteStore) -> None:
+    def _fill_jobs(self, store: Store) -> None:
         jt = self.query_one("#jobs", DataTable)
         keep = jt.cursor_row
         jt.clear()
@@ -133,7 +140,7 @@ class PunctualTUI(App[None]):
         if jt.row_count:
             jt.move_cursor(row=min(keep, jt.row_count - 1))
 
-    def _fill_detail(self, store: SqliteStore) -> None:
+    def _fill_detail(self, store: Store) -> None:
         job = self._selected_job()
         detail = self.query_one("#detail", Static)
         runs_tbl = self.query_one("#runs", DataTable)

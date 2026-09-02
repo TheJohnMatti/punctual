@@ -29,6 +29,8 @@ dependencies = [
 [project.optional-dependencies]
 # `pip install punctual-scheduler[tui]` — the core stays at click + croniter.
 tui = ["textual>=0.60"]
+# `pip install punctual-scheduler[postgres]` — a shared store for `--cluster`.
+postgres = ["psycopg[binary]>=3.1"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
@@ -39,6 +41,7 @@ dev = [
     "pytest-cov>=5",
     "pytest-xdist>=3",
     "textual>=0.60",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.scripts]

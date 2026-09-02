@@ -141,6 +141,32 @@ def test_observability_rejects_junk(tmp_path):
         load_config(cfg)
 
 
+def test_store_section(tmp_path):
+    cfg = write(
+        tmp_path,
+        """
+        [store]
+        url = "postgresql://u:p@h:5432/punctual"
+
+        [job.x]
+        schedule = "@hourly"
+        command = "true"
+        """,
+    )
+    assert load_config(cfg).store.url == "postgresql://u:p@h:5432/punctual"
+
+
+def test_store_defaults_to_none(tmp_path):
+    cfg = write(tmp_path, "[job.x]\nschedule='@hourly'\ncommand='true'")
+    assert load_config(cfg).store.url is None
+
+
+def test_store_rejects_bad_scheme(tmp_path):
+    cfg = write(tmp_path, "[store]\nurl='mysql://h/d'\n[job.x]\nschedule='@hourly'\ncommand='true'")
+    with pytest.raises(ConfigError, match="unsupported url scheme"):
+        load_config(cfg)
+
+
 def test_unknown_top_level_table_is_rejected(tmp_path):
     cfg = write(tmp_path, "[nonsense]\nx = 1\n[job.x]\nschedule='@hourly'\ncommand='true'")
     with pytest.raises(ConfigError, match="unknown top-level"):
