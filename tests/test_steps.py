@@ -69,6 +69,12 @@ def test_step_rejects_non_json_result(_job_env):
         steps_mod.step("bad", lambda: {1, 2})  # a set — not JSON
 
 
+def test_step_result_is_json_roundtripped_on_the_first_call(_job_env):
+    # a tuple comes back a list the first time too, so run == replay
+    assert steps_mod.step("t", lambda: (1, 2)) == [1, 2]
+    assert steps_mod.step("t", lambda: (9, 9)) == [1, 2]
+
+
 def test_completed_steps_survive_a_retry(tmp_path):
     """The real contract: a job that dies after step 1, re-run, step 1 not redone."""
     mod = f"pnc_steps_{uuid.uuid4().hex[:12]}"

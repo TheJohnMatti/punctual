@@ -108,8 +108,14 @@ class Scheduler:
 
             async with self._control_server(), self._metrics_http(), asyncio.TaskGroup() as tg:
                 while not self._stopping.is_set():
-                    if not self._become_leader():
-                        who = self.store.lease_holder(_LEASE) or "?"
+                    try:
+                        won = self._become_leader()
+                    except Exception:
+                        log.exception("acquiring the scheduler lease failed — retrying")
+                        await self._sleep(_LEASE_RENEW.total_seconds())
+                        continue
+                    if not won:
+                        who = self._lease_holder_name()
                         log.info("standby — %s holds the scheduler lease", who)
                         await self._sleep(_LEASE_RENEW.total_seconds())
                         continue
@@ -132,6 +138,21 @@ class Scheduler:
         self._leader, self._fence = True, lease.fence
         return True
 
+    def _renew_lease(self) -> bool:
+        """Extend our hold. A store error is treated as "lost it" — better to
+        step down and let another node lead than to crash the daemon."""
+        try:
+            return self.store.renew_lease(_LEASE, self.instance_id, self._fence, _LEASE_TTL)
+        except Exception:
+            log.exception("renewing the scheduler lease failed")
+            return False
+
+    def _lease_holder_name(self) -> str:
+        try:
+            return self.store.lease_holder(_LEASE) or "?"
+        except Exception:
+            return "?"
+
     async def _lead(self, tg: asyncio.TaskGroup) -> None:
         """The scheduling loop — runs only while we hold the lease."""
         self._last_tick = time.monotonic()
@@ -142,9 +163,7 @@ class Scheduler:
                 tg.create_task(self._run_sequence(job, fires))
 
         while not self._stopping.is_set():
-            if self.cluster and not self.store.renew_lease(
-                _LEASE, self.instance_id, self._fence, _LEASE_TTL
-            ):
+            if self.cluster and not self._renew_lease():
                 log.warning("lost the scheduler lease — stepping down to standby")
                 return
             self._dispatch_adhoc(tg)

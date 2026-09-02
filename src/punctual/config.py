@@ -216,8 +216,9 @@ def _load_python_jobs(modules: list[str]) -> list[Job]:
     wanted = set(modules)
     jobs = []
     for name, (fn, options) in registry.registered().items():
-        if fn.__module__ not in wanted:
-            continue  # a registration left over from a different config in this process
+        mod = getattr(fn, "__module__", "")
+        if not any(mod == w or mod.startswith(f"{w}.") for w in wanted):
+            continue  # a registration from a different config in this process
         ref = f"{fn.__module__}:{fn.__qualname__}"
         raw = {**options, "command": [sys.executable, "-m", "punctual._inproc", ref]}
         try:

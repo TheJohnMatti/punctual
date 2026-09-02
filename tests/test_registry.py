@@ -38,6 +38,18 @@ def test_decorator_rejects_command():
         job("x", command=["true"])
 
 
+def test_decorator_rejects_two_functions_same_name():
+    @job("dup", schedule="@daily")
+    def _a():
+        pass
+
+    with pytest.raises(ValueError, match="already registered"):
+
+        @job("dup", schedule="@hourly")
+        def _b():
+            pass
+
+
 def test_python_job_becomes_a_job(tmp_path, monkeypatch):
     mod = _module(
         tmp_path,
@@ -135,6 +147,26 @@ def test_inproc_runs_the_function(tmp_path, monkeypatch):
         cwd=tmp_path,
     )
     assert r.returncode == 0 and "worked" in r.stdout
+
+
+def test_inproc_usage_error():
+    r = subprocess.run(
+        [sys.executable, "-m", "punctual._inproc", "no-colon-here"],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 2 and "usage:" in r.stderr
+
+
+def test_inproc_missing_callable(tmp_path, monkeypatch):
+    mod = _module(tmp_path, monkeypatch, "x = 1\n")
+    r = subprocess.run(
+        [sys.executable, "-m", "punctual._inproc", f"{mod}:nope"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert r.returncode == 2 and "no callable" in r.stderr
 
 
 def test_inproc_propagates_failure(tmp_path, monkeypatch):

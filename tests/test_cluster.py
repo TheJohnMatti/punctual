@@ -98,6 +98,34 @@ async def test_leader_steps_down_when_a_renew_fails(tmp_path, monkeypatch):
     store.close()
 
 
+async def test_a_store_error_during_renew_steps_down_not_crashes(tmp_path, monkeypatch):
+    monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=2))
+    monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.2))
+    store = SqliteStore(tmp_path / "d.db")
+    sc = Scheduler([_job("a")], store, "one", handle_signals=False, cluster=True)
+
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("db went away")
+        return True
+
+    monkeypatch.setattr(store, "renew_lease", boom)
+    task = asyncio.create_task(sc.run())
+
+    for _ in range(60):
+        await asyncio.sleep(0.1)
+        if calls["n"] >= 4 and sc._leader:  # stepped down on the error, re-acquired
+            break
+    assert calls["n"] >= 4 and not task.done()  # daemon survived the store error
+
+    sc.request_drain()
+    await asyncio.wait_for(task, timeout=10)
+    store.close()
+
+
 async def test_second_daemon_stands_by_then_takes_over(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod, "_LEASE_TTL", timedelta(seconds=3))
     monkeypatch.setattr(sched_mod, "_LEASE_RENEW", timedelta(seconds=0.4))
