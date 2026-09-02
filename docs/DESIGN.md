@@ -324,6 +324,38 @@ upstream job names) — enforced at config load, along with cycle rejection
   near-immediate (else within `MAX_SLEEP`). Retries / quarantine / recovery all
   work unchanged on triggered jobs. New `runs.note` column (schema v5).
 
+### O13 — Clustering  *(lease + leader election built — M5 slice 1)*
+Run two+ daemons off one shared store for availability. **Exactly one schedules
+at a time** (a lease); the rest are hot standby, ready to take over.
+
+- **Decision: single leader, not partitioned work.** A partitioned design (each
+  daemon owns a job subset) doubles the failure modes — rebalancing, split
+  ownership, per-job leases — for a scheduler whose whole job is cheap
+  bookkeeping. One leader is trivially correct and the standby's only cost is an
+  idle process. Revisit only if a single loop can't keep up (it can: a tick is
+  microseconds of SQL).
+- **The lease.** `leases(resource, holder, fence, expires_at)`, one row, keyed
+  `resource = "scheduler"`. `acquire_lease` takes it iff free / expired / already
+  ours, **bumping `fence`** (a monotonic counter). `renew_lease` extends
+  `expires_at` iff we still hold it *at our fence*. TTL 30 s, renewed every 10 s.
+- **`--cluster` flag** (off by default — a lone daemon pays nothing). On:
+  `run()` loops `acquire → lead → (lost lease) → standby → retry`. `_lead`
+  renews every tick; a failed renew = "someone stole / expired us" → drop all
+  scheduling, back to standby. `healthz` reports `standby` (a healthy state, not
+  a stall); `control_status` reports `role: leader|standby|solo`;
+  `punctual trigger` on a standby is refused with "trigger on the leader".
+- **Fencing token.** `fence` rides on the `Lease`; the plan is to stamp it into
+  the claim key / side-effects so a paused-then-resumed zombie ex-leader can't
+  write after the lease moved on. `renew_lease`'s fence check already blocks the
+  common case (zombie keeps renewing a fence that's been superseded).
+- **Failover time** = up to TTL (lease expiry) + renew interval (standby poll) ≈
+  30–40 s. Tunable; kept conservative so a GC pause / brief network blip doesn't
+  trigger a needless handoff.
+- Standby's control socket stays live throughout (its own `$PUNCTUAL_SOCKET`),
+  so `ping` / `healthz` / `metrics` work on every node.
+- **M5 slice 2:** a real `PostgresStore` so the shared store isn't a
+  single-host SQLite file — the actual point of clustering.
+
 ### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
 Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
 retries), **`on_quarantine`** (the breaker opens), **`on_recovery`** (a
@@ -418,5 +450,11 @@ quarantined / degraded job succeeds again — M3 slice 1).
     `punctual trigger <job>` — a control command that queues an ad-hoc run
     (`scheduled_for = now`, `note = "manual trigger"`), ignoring schedule /
     `after` / quarantine. **⇒ M4 done.**
-- **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.
+- **M5 — cluster** (O13). Slices:
+  - *slice 1 ✅* — `leases` table (schema v6), `acquire` / `renew` / `release` /
+    `lease_holder` on `Store`; `run --cluster` → lease-based single leader,
+    others hot standby; fencing token on `Lease`; `healthz` / `control_status` /
+    `trigger` cluster-aware.
+  - *slice 2* — full `PostgresStore` (`psycopg` v3, `[postgres]` extra), a
+    `[store] url` config selector, a CI job running the suite against real PG.
 - **M6 — durable steps**: `@punctual.step` in-process checkpointing.

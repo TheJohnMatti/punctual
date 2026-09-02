@@ -64,6 +64,12 @@ log = logging.getLogger("punctual.scheduler")
 # reload is picked up within a bounded delay even when the next fire is hours off.
 MAX_SLEEP = 60.0
 
+# M5 — the scheduler lease. TTL is how long a dead leader's lease lingers before
+# a standby can grab it; RENEW is how often the leader (and standbys) re-check.
+_LEASE = "scheduler"
+_LEASE_TTL = timedelta(seconds=30)
+_LEASE_RENEW = timedelta(seconds=10)
+
 
 @dataclass(slots=True)
 class Scheduler:
@@ -74,7 +80,10 @@ class Scheduler:
     control: bool = False  # control socket (M2 slice 4) — `serve()` turns it on
     config_reload: Callable[[], list[Job]] | None = None  # re-parse punctual.toml
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    cluster: bool = False  # M5 — take a lease before scheduling; hot-standby otherwise
 
+    _leader: bool = field(default=False, init=False)
+    _fence: int = field(default=0, init=False)
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _inflight: dict[str, int] = field(default_factory=lambda: defaultdict(int), init=False)
@@ -98,23 +107,52 @@ class Scheduler:
             self._check_sinks()
 
             async with self._control_server(), self._metrics_http(), asyncio.TaskGroup() as tg:
-                self._recover(tg)
-                for job in self._enabled():
-                    fires = self._plan_catch_up(job)
-                    if fires:
-                        tg.create_task(self._run_sequence(job, fires))
-
                 while not self._stopping.is_set():
-                    self._dispatch_adhoc(tg)
-                    self._dispatch_due(tg)
-                    self._sweep_retries(tg)
-                    self._dispatch_triggered(tg)
-                    self._last_tick = time.monotonic()
-                    await self._sleep(self._time_to_next())
-            # exiting the TaskGroup waits for in-flight runs to finish (drain)
+                    if not self._become_leader():
+                        who = self.store.lease_holder(_LEASE) or "?"
+                        log.info("standby — %s holds the scheduler lease", who)
+                        await self._sleep(_LEASE_RENEW.total_seconds())
+                        continue
+                    log.info("acquired scheduler lease (fence %d)", self._fence)
+                    await self._lead(tg)
+                    self._leader = False
             await notify.drain()
         finally:
+            with contextlib.suppress(Exception):
+                self.store.release_lease(_LEASE, self.instance_id)
             self._remove_signal_handlers()
+
+    def _become_leader(self) -> bool:
+        if not self.cluster:
+            self._leader = True
+            return True
+        lease = self.store.acquire_lease(_LEASE, self.instance_id, _LEASE_TTL)
+        if lease is None:
+            return False
+        self._leader, self._fence = True, lease.fence
+        return True
+
+    async def _lead(self, tg: asyncio.TaskGroup) -> None:
+        """The scheduling loop — runs only while we hold the lease."""
+        self._last_tick = time.monotonic()
+        self._recover(tg)
+        for job in self._enabled():
+            fires = self._plan_catch_up(job)
+            if fires:
+                tg.create_task(self._run_sequence(job, fires))
+
+        while not self._stopping.is_set():
+            if self.cluster and not self.store.renew_lease(
+                _LEASE, self.instance_id, self._fence, _LEASE_TTL
+            ):
+                log.warning("lost the scheduler lease — stepping down to standby")
+                return
+            self._dispatch_adhoc(tg)
+            self._dispatch_due(tg)
+            self._sweep_retries(tg)
+            self._dispatch_triggered(tg)
+            self._last_tick = time.monotonic()
+            await self._sleep(min(self._time_to_next(), _LEASE_RENEW.total_seconds()))
 
     def _rebuild_dep_graph(self) -> None:
         self._downstreams = defaultdict(list)
@@ -148,6 +186,8 @@ class Scheduler:
     def healthz(self) -> tuple[bool, str]:
         if self._stopping.is_set():
             return False, "draining"
+        if self.cluster and not self._leader:
+            return True, "standby"
         stale = time.monotonic() - self._last_tick
         if stale > MAX_SLEEP + 5:
             return False, f"scheduler loop stalled — no tick for {stale:.0f}s"
@@ -172,6 +212,8 @@ class Scheduler:
         quarantine. `scheduled_for` = now."""
         if self._job(job) is None:
             return {"ok": False, "error": f"no job named {job!r}"}
+        if self.cluster and not self._leader:
+            return {"ok": False, "error": "not the leader — trigger on the leader daemon"}
         self._adhoc.append(job)
         self._wake.set()
         return {"ok": True, "job": job}
@@ -181,6 +223,7 @@ class Scheduler:
 
         return {
             "pid": os.getpid(),
+            "role": ("leader" if self._leader else "standby") if self.cluster else "solo",
             "jobs": len(self._enabled()),
             "uptime_s": round((datetime.now(UTC) - self._started).total_seconds()),
             "in_flight": self.in_flight(),
@@ -768,6 +811,7 @@ async def serve(
     *,
     config_reload: Callable[[], list[Job]] | None = None,
     observability: ObservabilityConfig | None = None,
+    cluster: bool = False,
 ) -> None:
     await Scheduler(
         jobs=jobs,
@@ -776,4 +820,5 @@ async def serve(
         control=True,
         config_reload=config_reload,
         observability=observability or ObservabilityConfig(),
+        cluster=cluster,
     ).run()
