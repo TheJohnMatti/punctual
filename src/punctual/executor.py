@@ -19,7 +19,7 @@ import json
 import os
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -60,9 +60,11 @@ class _Ring:
         return bytes(self._buf)
 
 
-def _child_env(job: Job, run: Run) -> dict[str, str]:
+def _child_env(job: Job, run: Run, extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env.update(job.env)
+    if extra:  # e.g. the store's reconnect vars, so `step()` can reach it (M6)
+        env.update(extra)
     # O4: the job can use these to dedupe its own side effects.
     env["PUNCTUAL_RUN_ID"] = str(run.id)
     env["PUNCTUAL_JOB"] = job.name
@@ -85,6 +87,7 @@ async def execute(
     timeout: timedelta | None,
     on_spawn: Callable[[int], None] | None = None,
     run_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Outcome:
     """Spawn ``job.command``, capture the output tail, enforce ``timeout``.
 
@@ -107,7 +110,7 @@ async def execute(
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=job.workdir,
-            env=_child_env(job, run),
+            env=_child_env(job, run, env),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # own process group -> group-wide kill

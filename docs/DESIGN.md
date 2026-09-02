@@ -410,7 +410,34 @@ both ways is an error.
 - `_inproc` and `_load_python_jobs` both put `""` (cwd) on `sys.path`, so
   `modules = ["myjobs"]` resolves when the daemon runs from the project dir; an
   installed package resolves regardless.
-- **M6 slice 2:** `step(name, fn)` durable checkpoints *inside* a job body.
+
+**Durable steps (M6 slice 2).** `step(name, fn)` inside a job body runs `fn`
+once per fire and caches its result; a retry of the same fire replays completed
+steps instead of re-running them.
+
+    @job("sync", schedule="0 * * * *", retries={"max": 3})
+    def sync():
+        rows = step("fetch", lambda: api.export())     # runs once
+        step("load", lambda: warehouse.upsert(rows))   # this fails → job retries
+                                                       # → "fetch" is replayed,
+                                                       #   not re-run
+
+- **Keyed `(job, scheduled_for, name)`** in a `steps` table (schema v7). The
+  fire's `scheduled_for` is the same claim key every attempt shares, so retries
+  coalesce and a *new* fire starts fresh. Result stored as JSON.
+- **Decision: sync, JSON results, same process as the job.** `step()` is a
+  plain function call inside the (subprocess) job body — no async second code
+  path, no pickle in the state DB. Non-JSON results raise at the `step()` call.
+- **Contract: control flow between steps must be deterministic.** A step that
+  doesn't execute on the retry can't have its result replayed. Documented; not
+  enforced (that's a workflow engine — out of scope).
+- **How `step()` reaches the store:** the daemon puts the store's reconnect env
+  (`PUNCTUAL_DB` or `PUNCTUAL_STORE_URL`, via `Store.child_env()`) into the job's
+  environment alongside `PUNCTUAL_JOB` / `PUNCTUAL_SCHEDULED_FOR`; `step()` opens
+  its own connection (cached per process). Outside a punctual-run job it raises.
+- Completed step rows aren't GC'd — one row per step per fire, same as run
+  history. A retention sweep is a later concern.
+- `why <job> <run-id>` lists the steps that completed for that fire.
 
 ### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
 Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
@@ -437,6 +464,14 @@ quarantined / degraded job succeeds again — M3 slice 1).
 ---
 
 ## Milestones
+
+**M0–M6 are all built** (2026-09-01). punctual is a complete cron replacement:
+scheduling + catch-up, retries + quarantine, dependencies, observability
+(metrics / logs / TUI / notifications), a control socket, leader-elected
+clustering on a Postgres store, and Python jobs with durable `step()`
+checkpoints. Post-M6 ideas live under "Later" in the relevant O-items (digest
+notifications, OTel spans, a step-row retention sweep, config-form Postgres
+DSNs).
 
 - **M0 — skeleton** *(now)*: repo, config parse + validate, `Store` + SQLite impl,
   data models, CLI stubs, CI.
@@ -520,5 +555,7 @@ quarantined / degraded job succeeds again — M3 slice 1).
     `[python] modules` config; `punctual/_inproc.py` re-exec entry point; jobs
     built through the same `_build_job` as TOML; `validate` / `why` show
     `py <module>:<func>`.
-  - *slice 2* — `step(name, fn)`: run once, cache the JSON result keyed by
-    `(job, scheduled_for, name)` so a retry skips completed steps.
+  - *slice 2 ✅* — `step(name, fn)` (`punctual/steps.py`): run once, cache the
+    JSON result keyed by `(job, scheduled_for, name)` (schema v7) so a retry
+    replays completed steps; `Store.child_env()` gets the store to the
+    subprocess; `why` lists completed steps. **⇒ M6 done.**
