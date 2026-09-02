@@ -103,7 +103,8 @@ def validate(ctx: click.Context) -> None:
     for j in jobs:
         flag = "" if j.enabled else "  (disabled)"
         trigger = j.schedule or f"after {', '.join(j.after)}"
-        click.echo(f"  {j.name:20} {trigger:20} {' '.join(j.command)}{flag}")
+        what = f"py {j.python_ref}" if j.python_ref else " ".join(j.command)
+        click.echo(f"  {j.name:20} {trigger:20} {what}{flag}")
 
     uris = [u for j in jobs for u in (j.on_fail, j.on_quarantine, j.on_recovery)]
     problems = notify.check(uris)
@@ -258,6 +259,8 @@ def _render_job(r: dict[str, Any]) -> None:
     colour = {"ok": "green", "degraded": "yellow", "quarantined": "red", "disabled": "bright_black"}
     trig = f"after {', '.join(r['after'])}" if r["after"] else f"{r['schedule']}, {r['timezone']}"
     click.echo(f"{click.style(r['job'], bold=True)}  ({trig})")
+    if r.get("python_ref"):
+        click.echo(f"  runs       py {r['python_ref']}")
     click.echo(f"  health     {click.style(r['health'], fg=colour.get(r['health']))}")
     if r["quarantine"]:
         q = r["quarantine"]

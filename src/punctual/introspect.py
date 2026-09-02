@@ -103,6 +103,7 @@ def explain_job(
     return {
         "job": job.name,
         "schedule": job.schedule,
+        "python_ref": job.python_ref,
         "after": job.after or None,
         "downstreams": downstreams or None,
         "depends": _upstream_status(job, store) if job.triggered else None,
