@@ -66,6 +66,21 @@ def test_explain_run_tells_the_retry_story(tmp_path):
     assert r2["trigger"] == "retry of attempt 1"
     assert r2["prior_attempts"] == [{"attempt": 1, "state": "failed", "exit_code": 1}]
     assert r2["what_happened_next"] == "succeeded after 1 failed attempt(s)"
+    assert r2["steps"] is None
+    store.close()
+
+
+def test_explain_run_lists_completed_steps(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    fire = _fire()
+    run = store.claim("j", fire, "d")
+    run.transition_to(RunState.RUNNING)
+    run.transition_to(RunState.SUCCEEDED)
+    store.mark(run)
+    store.record_step("j", fire, "fetch", "[]")
+    store.record_step("j", fire, "load", "1")
+
+    assert explain_run(run, store)["steps"] == ["fetch", "load"]
     store.close()
 
 

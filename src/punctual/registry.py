@@ -47,5 +47,6 @@ def registered() -> dict[str, tuple[Callable[[], Any], dict[str, Any]]]:
 
 
 def clear() -> None:
-    """Drop all registrations (tests / a config reload starting clean)."""
+    """Drop all registrations. For tests — `load_config` deliberately does *not*
+    clear (an already-imported module won't re-run its decorators)."""
     _REGISTERED.clear()

@@ -106,7 +106,30 @@ def test_store_from_url_postgres_defers_to_postgresstore(monkeypatch):
     assert isinstance(s, PostgresStore) and seen["dsn"] == "postgresql://u@h/db"
 
 
+def test_store_from_url_sqlite_memory(monkeypatch):
+    monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
+    s = store_from_url("sqlite://:memory:")
+    assert isinstance(s, SqliteStore) and str(s.path) == ":memory:"
+    assert s.child_env() == {}  # nothing to hand a subprocess
+    s.close()
+
+
+def test_store_from_url_env_overrides_arg(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUNCTUAL_STORE_URL", f"sqlite://{tmp_path / 'env.db'}")
+    s = store_from_url("sqlite:///wherever/ignored.db")
+    assert isinstance(s, SqliteStore) and s.path == tmp_path / "env.db"
+    s.close()
+
+
 def test_store_from_url_rejects_unknown_scheme(monkeypatch):
     monkeypatch.delenv("PUNCTUAL_STORE_URL", raising=False)
     with pytest.raises(ValueError, match="scheme"):
         store_from_url("mysql://nope")
+
+
+def test_sqlite_child_env_is_absolute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    s = store_from_url("sqlite://rel.db")  # relative in the URL
+    env = s.child_env()
+    assert env["PUNCTUAL_DB"] == str((tmp_path / "rel.db").resolve())
+    s.close()

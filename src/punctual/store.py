@@ -259,9 +259,9 @@ class Store(Protocol):
 
 
 class _BaseStore:
-    """Every query, once. Subclasses supply the connection and the four spots
-    where the dialects differ (`_exec`, `_executescript`, schema-version and
-    column introspection)."""
+    """Every query, once. Subclasses supply the connection plus the few spots
+    the dialects differ: statement execution (`_exec` / `_executescript`), the
+    schema-version marker, and table/column introspection for migrations."""
 
     _PK = "INTEGER PRIMARY KEY"
     state_dir: Path | None = None
@@ -463,18 +463,15 @@ class _BaseStore:
     def acquire_lease(self, resource: str, holder: str, ttl: timedelta) -> Lease | None:
         now = datetime.now(UTC)
         exp = _utc(now + ttl)
-        cur = self._exec(
+        row = self._exec(
             "INSERT INTO leases (resource, holder, fence, expires_at) VALUES (?,?,1,?) "
             "ON CONFLICT(resource) DO UPDATE SET "
             "  holder=excluded.holder, fence=leases.fence + 1, expires_at=excluded.expires_at "
-            "WHERE leases.expires_at < ? OR leases.holder = ?",
+            "WHERE leases.expires_at < ? OR leases.holder = ? "
+            "RETURNING *",
             (resource, holder, exp, _utc(now), holder),
-        )
-        if cur.rowcount == 0:
-            return None  # someone else holds a live lease
-        row = self._exec(
-            "SELECT * FROM leases WHERE resource=? AND holder=?", (resource, holder)
         ).fetchone()
+        # no row: the conflicting lease is live and held by someone else
         return Lease(resource, holder, row["fence"], _parse_req(row["expires_at"])) if row else None
 
     def renew_lease(self, resource: str, holder: str, fence: int, ttl: timedelta) -> bool:
@@ -636,7 +633,10 @@ class SqliteStore(_BaseStore):
         return {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
 
     def child_env(self) -> dict[str, str]:
-        return {} if str(self.path) == ":memory:" else {"PUNCTUAL_DB": str(self.path)}
+        # absolute — a job with its own workdir must reach the same file
+        if str(self.path) == ":memory:":
+            return {}
+        return {"PUNCTUAL_DB": str(self.path.resolve())}
 
     def close(self) -> None:
         self._db.close()

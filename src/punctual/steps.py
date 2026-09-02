@@ -12,7 +12,9 @@
 
 A step runs its function once per fire, keyed by ``(job, scheduled_for, name)``.
 On a retry, a completed step returns its cached result without calling ``fn``.
-The result must be JSON-serialisable. Control flow *between* steps must be
+The result must be JSON-serialisable and is round-tripped through JSON on the
+first call too, so a step returns the same thing whether it ran or replayed
+(a tuple comes back a list, etc.). Control flow *between* steps must be
 deterministic — a step that doesn't run on the retry can't have its result
 replayed.
 
@@ -26,6 +28,7 @@ import json
 import os
 from collections.abc import Callable
 from datetime import datetime
+from typing import Any
 
 from punctual.store import Store, store_from_url
 
@@ -46,13 +49,14 @@ def _ctx() -> tuple[Store, str, datetime]:
     return _store, job, datetime.fromisoformat(fire)
 
 
-def step[T](name: str, fn: Callable[[], T]) -> T:
+def step(name: str, fn: Callable[[], Any]) -> Any:
     """Run ``fn`` once for this fire and cache its (JSON) result under ``name``;
-    on a replay return the cached result without calling ``fn`` again."""
+    on a replay return the cached result without calling ``fn`` again. The result
+    is JSON round-tripped either way, so it's identical on run and on replay."""
     store, job, fire = _ctx()
     hit, cached = store.get_step(job, fire, name)
     if hit:
-        return cached  # type: ignore[no-any-return]
+        return cached
 
     result = fn()
     try:
@@ -60,4 +64,4 @@ def step[T](name: str, fn: Callable[[], T]) -> T:
     except TypeError as e:
         raise TypeError(f"step({name!r}) result is not JSON-serialisable: {e}") from e
     store.record_step(job, fire, name, payload)
-    return result
+    return json.loads(payload)
