@@ -147,8 +147,11 @@ class PunctualTUI(App[None]):
             return
 
         r = introspect.explain_job(job, store)
+        trig = (
+            f"after {', '.join(r['after'])}" if r["after"] else f"{r['schedule']}, {r['timezone']}"
+        )
         lines = [
-            f"[b]{job.name}[/b]  ({r['schedule']}, {r['timezone']})",
+            f"[b]{job.name}[/b]  ({trig})",
             f"health: [{_HEALTH_STYLE.get(r['health'], 'white')}]{r['health']}[/]",
         ]
         if r["quarantine"]:
@@ -159,7 +162,8 @@ class PunctualTUI(App[None]):
         if r["pending_retry"]:
             pr = r["pending_retry"]
             lines.append(f"retry: attempt {pr['attempt']} at {_short(pr['not_before'])}")
-        lines.append(f"next fire: {_short(r['next_fire'])}")
+        if not r["after"]:
+            lines.append(f"next fire: {_short(r['next_fire'])}")
 
         history = store.history(job.name, limit=20)
         for run in history:

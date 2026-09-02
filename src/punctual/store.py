@@ -31,7 +31,7 @@ class MetricsSnapshot:
 
 
 # Bump when SCHEMA changes; add the matching step to _migrate().
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS runs (
     stdout_tail    TEXT,                   -- O5: last N bytes, decoded
     stderr_tail    TEXT,
     not_before     TEXT,                   -- M2: a RETRYING row is due at/after this
+    note           TEXT,                   -- M4: SKIPPED / LOST cause, etc.
     created_at     TEXT NOT NULL,
     UNIQUE (job, scheduled_for, attempt)   -- DESIGN O4: the claim key
 );
@@ -79,6 +80,7 @@ _ADDED_COLUMNS = {
         "stdout_tail": "TEXT",
         "stderr_tail": "TEXT",
         "not_before": "TEXT",
+        "note": "TEXT",
     },
     "job_clock": {
         "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
@@ -147,6 +149,9 @@ class Store(Protocol):
     def attempts_for(self, job: str, scheduled_for: datetime) -> list[Run]: ...
     def pending_retry(self, job: str) -> Run | None: ...
     def metrics_snapshot(self) -> MetricsSnapshot: ...
+    def last_run(self, job: str) -> Run | None: ...
+    def last_success_fire(self, job: str) -> datetime | None: ...
+    def record_skip(self, job: str, scheduled_for: datetime, by: str, note: str) -> Run | None: ...
 
     def job_state(self, job: str) -> JobState:
         """The per-job state row (defaults if the job has no row yet)."""
@@ -205,7 +210,7 @@ class SqliteStore:
         self._db.execute(
             "UPDATE runs SET state=?, started_at=?, finished_at=?, exit_code=?, "
             "heartbeat_at=?, pid=?, pid_start_time=?, stdout_tail=?, stderr_tail=?, "
-            "not_before=? WHERE id=?",
+            "not_before=?, note=? WHERE id=?",
             (
                 run.state.value,
                 _utc(run.started_at) if run.started_at else None,
@@ -217,6 +222,7 @@ class SqliteStore:
                 run.stdout_tail,
                 run.stderr_tail,
                 _utc(run.not_before) if run.not_before else None,
+                run.note,
                 run.id,
             ),
         )
@@ -319,6 +325,33 @@ class SqliteStore:
         ).fetchone()
         return self._row_to_run(row) if row else None
 
+    # --- dependencies (M4) --------------------------------------------
+    def last_run(self, job: str) -> Run | None:
+        row = self._db.execute(
+            "SELECT * FROM runs WHERE job=? ORDER BY scheduled_for DESC, attempt DESC LIMIT 1",
+            (job,),
+        ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def last_success_fire(self, job: str) -> datetime | None:
+        row = self._db.execute(
+            "SELECT MAX(scheduled_for) t FROM runs WHERE job=? AND state='succeeded'", (job,)
+        ).fetchone()
+        return _parse(row["t"]) if row and row["t"] else None
+
+    def record_skip(self, job: str, scheduled_for: datetime, by: str, note: str) -> Run | None:
+        now = _utc(datetime.now(UTC))
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO runs (job, scheduled_for, state, claimed_by, "
+            "finished_at, note, created_at) VALUES (?,?,?,?,?,?,?)",
+            (job, _utc(scheduled_for), RunState.SKIPPED.value, by, now, note, now),
+        )
+        if cur.rowcount == 0:
+            return None
+        return self._row_to_run(
+            self._db.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        )
+
     def metrics_snapshot(self) -> MetricsSnapshot:
         snap = MetricsSnapshot()
         for r in self._db.execute(
@@ -397,4 +430,5 @@ class SqliteStore:
             stderr_tail=r["stderr_tail"],
             not_before=_parse(r["not_before"]),
             created_at=_parse(r["created_at"]),
+            note=r["note"],
         )

@@ -33,9 +33,8 @@ command   = "python -m sniper.scrape"
 on_missed = "skip"                       # skip | run_latest | run_each
 
 [job.retrain]
-schedule  = "0 8 * * 1"
 command   = "python -m sniper.retrain"
-after     = ["scrape"]                   # dependency edge
+after     = ["scrape"]                   # runs when scrape succeeds (no clock)
 timeout   = "45m"
 retries   = { max = 3, backoff = "exponential" }
 on_fail   = "ntfy://my-topic"            # page after retries are exhausted
@@ -86,14 +85,15 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2 + M3):** scheduling, subprocess exec with output
-> capture + timeouts, durable history, restart recovery + catch-up, retries with
-> backoff, a quarantine circuit-breaker, failure/recovery notifications
-> (`ntfy` / `slack` / `discord` / `exec` / webhook / plugins), `why` / `status` /
-> annotated `plan`, a control socket (`drain` / `stop` / `reload`), Prometheus
-> `/metrics` + `/healthz`, structured JSON logs (`--log-format json`), and a
-> read-only TUI. **Not yet:** job dependencies (M4). See
-> [`docs/DESIGN.md`](docs/DESIGN.md).
+> **What works today (M1 + M2 + M3 + M4 slice 1):** scheduling, `after`
+> dependencies (trigger-driven, fan-in, upstream-failure policy), subprocess exec
+> with output capture + timeouts, durable history, restart recovery + catch-up,
+> retries with backoff, a quarantine circuit-breaker, failure/recovery
+> notifications (`ntfy` / `slack` / `discord` / `exec` / webhook / plugins),
+> `why` / `status` / annotated `plan`, a control socket (`drain` / `stop` /
+> `reload`), Prometheus `/metrics` + `/healthz`, structured JSON logs
+> (`--log-format json`), and a read-only TUI. **Not yet:** a dependency graph
+> view, clustering (M5). See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 

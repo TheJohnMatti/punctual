@@ -52,6 +52,7 @@ from punctual.models import (
     OnLost,
     Run,
     RunState,
+    UpstreamFailure,
 )
 from punctual.process import identity_matches, pid_start_time
 from punctual.schedule import fires_between, next_fire
@@ -82,6 +83,7 @@ class Scheduler:
     _started: datetime = field(default_factory=lambda: datetime.now(UTC), init=False)
     _last_tick: float = field(default_factory=time.monotonic, init=False)  # monotonic
     _loop_lag: float = 0.0
+    _downstreams: dict[str, list[str]] = field(default_factory=dict, init=False)  # up -> [down]
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -90,6 +92,7 @@ class Scheduler:
             self._last_tick = time.monotonic()
             for job in self.jobs:
                 self._since.setdefault(job.name, self._started)
+            self._rebuild_dep_graph()
             self._check_sinks()
 
             async with self._control_server(), self._metrics_http(), asyncio.TaskGroup() as tg:
@@ -102,12 +105,19 @@ class Scheduler:
                 while not self._stopping.is_set():
                     self._dispatch_due(tg)
                     self._sweep_retries(tg)
+                    self._dispatch_triggered(tg)
                     self._last_tick = time.monotonic()
                     await self._sleep(self._time_to_next())
             # exiting the TaskGroup waits for in-flight runs to finish (drain)
             await notify.drain()
         finally:
             self._remove_signal_handlers()
+
+    def _rebuild_dep_graph(self) -> None:
+        self._downstreams = defaultdict(list)
+        for j in self.jobs:
+            for up in j.after:
+                self._downstreams[up].append(j.name)
 
     def _check_sinks(self) -> None:
         notify.load_sinks()
@@ -294,6 +304,8 @@ class Scheduler:
         """Which missed fires to replay, and advance the cursor past them now
         (so the tick loop resumes cleanly). Returns [] when there's nothing to do.
         """
+        if job.triggered or job.schedule is None:
+            return []  # no clock — `_dispatch_triggered` re-evaluates on start anyway
         baseline = self.store.last_fire(job.name)
         now = datetime.now(UTC)
         if self.store.job_state(job.name).quarantined:
@@ -344,6 +356,8 @@ class Scheduler:
     def _dispatch_due(self, tg: asyncio.TaskGroup) -> None:
         now = datetime.now(UTC)
         for job in self._enabled():
+            if job.triggered:
+                continue  # handled by _dispatch_triggered
             due = self._latest_due(job, now)
             if due is None:
                 continue
@@ -364,6 +378,78 @@ class Scheduler:
             if run is None:
                 continue  # already claimed (another daemon, or recovery)
             self._launch(job, run, tg)
+
+    # --- dependencies (O12) ------------------------------------------
+    def _dispatch_triggered(self, tg: asyncio.TaskGroup) -> None:
+        for job in self._enabled():
+            if not job.triggered:
+                continue
+            state = self.store.job_state(job.name)
+            if state.quarantined and not self._quarantine_lets_fire_through(
+                job, state, datetime.now(UTC)
+            ):
+                continue
+            last = state.last_fire  # when this downstream last fired / was skipped
+
+            ready_at: datetime | None = None  # newest upstream success we'll consume
+            failed: tuple[str, datetime] | None = None  # (upstream, its failed fire)
+            pending = False  # an upstream with nothing new yet
+
+            for up in job.after:
+                ok = self.store.last_success_fire(up)
+                if ok is not None and (last is None or ok > last):
+                    ready_at = ok if ready_at is None else max(ready_at, ok)
+                    continue
+                lr = self.store.last_run(up)
+                new_failure = (
+                    lr is not None
+                    and lr.state in FAILURE_OUTCOMES
+                    and (last is None or lr.scheduled_for > last)
+                )
+                if new_failure:
+                    failed = (up, lr.scheduled_for)  # type: ignore[union-attr]
+                else:
+                    pending = True
+
+            if failed is not None:
+                self._on_upstream_failure(job, *failed, tg)
+            elif pending or ready_at is None:
+                continue  # wait for the slow upstream(s)
+            elif self._inflight[job.name] < job.concurrency:
+                run = self.store.claim(job.name, ready_at, self.instance_id)
+                if run is not None:
+                    log.info(
+                        "%s triggered by %s (fire %s)",
+                        job.name,
+                        ", ".join(job.after),
+                        ready_at.isoformat(timespec="minutes"),
+                        extra={"event": "triggered", "job": job.name, "after": job.after},
+                    )
+                    self._launch(job, run, tg)
+
+    def _on_upstream_failure(
+        self, job: Job, upstream: str, fire: datetime, tg: asyncio.TaskGroup
+    ) -> None:
+        if job.on_upstream_failure is UpstreamFailure.WAIT:
+            return  # hold; re-check next tick (slice 3 adds a timeout)
+        if job.on_upstream_failure is UpstreamFailure.RUN:
+            if self._inflight[job.name] < job.concurrency:
+                run = self.store.claim(job.name, fire, self.instance_id)
+                if run is not None:
+                    run.note = f"ran despite upstream {upstream} failure"
+                    log.warning("%s: running despite upstream %s failure", job.name, upstream)
+                    self._launch(job, run, tg)
+            return
+        # SKIP (default)
+        note = f"upstream {upstream} failed"
+        if self.store.record_skip(job.name, fire, self.instance_id, note) is not None:
+            log.warning(
+                "%s: skipped — %s",
+                job.name,
+                note,
+                extra={"event": "skipped", "job": job.name, "reason": note},
+            )
+        self.store.set_last_fire(job.name, fire)
 
     def _quarantine_lets_fire_through(self, job: Job, state: JobState, now: datetime) -> bool:
         """Despite quarantine, run this fire? — an operator resume, or a cooldown probe."""
@@ -387,6 +473,7 @@ class Scheduler:
         last entry — run_latest semantics — so a slow loop or a laptop suspend
         can't stampede the tick loop (cross-restart catch-up is `_plan_catch_up`).
         """
+        assert job.schedule is not None  # triggered jobs never reach here
         cursor = next_fire(job.schedule, self._since[job.name], job.timezone)
         due: datetime | None = None
         while cursor <= now:
@@ -396,7 +483,11 @@ class Scheduler:
 
     def _time_to_next(self) -> float:
         now = datetime.now(UTC)
-        candidates = [next_fire(j.schedule, now, j.timezone) for j in self._enabled()]
+        candidates = [
+            next_fire(j.schedule, now, j.timezone)
+            for j in self._enabled()
+            if j.schedule is not None
+        ]
         if (retry_at := self.store.next_retry_at()) is not None:
             candidates.append(retry_at)
         if not candidates:
@@ -461,6 +552,8 @@ class Scheduler:
             )
         self._cleanup_run_dir(run)
         self._update_health(job, run, outcome)
+        if self._downstreams.get(job.name):
+            self._wake.set()  # an upstream just finished — re-check triggered jobs
 
     # --- quarantine (M2 slice 2) ---------------------------------------
     def _update_health(self, job: Job, run: Run, outcome: RunState) -> None:

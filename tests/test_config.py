@@ -34,12 +34,11 @@ def test_full_job(tmp_path):
         tmp_path,
         """
         [job.retrain]
-        schedule = "0 8 * * 1"
         command = ["python", "-m", "sniper.retrain"]
         timezone = "America/Toronto"
-        on_missed = "run_latest"
         timeout = "45m"
         after = ["scrape"]
+        on_upstream_failure = "run"
         retries = { max = 3, backoff = "exponential", base_delay = "30s" }
 
         [job.scrape]
@@ -52,7 +51,8 @@ def test_full_job(tmp_path):
     r = jobs["retrain"]
     assert r.timezone == "America/Toronto"
     assert r.timeout == timedelta(minutes=45)
-    assert r.after == ["scrape"]
+    assert r.after == ["scrape"] and r.schedule is None and r.triggered
+    assert r.on_upstream_failure.value == "run"
     assert r.retries.max == 3
     assert r.retries.backoff is Backoff.EXPONENTIAL
     assert r.retries.base_delay == timedelta(seconds=30)
@@ -98,7 +98,9 @@ def test_on_lost_defaults_derive_from_idempotent(tmp_path):
             "[job.x]\nschedule='0 3 * * *'\ncommand='true'\non_missed='sometimes'",
             "on_missed must be",
         ),
-        ("[job.a]\nschedule='@daily'\ncommand='true'\nafter=['ghost']", "unknown job 'ghost'"),
+        ("[job.a]\ncommand='true'\nafter=['ghost']", "unknown job 'ghost'"),
+        ("[job.a]\nschedule='@daily'\ncommand='true'\nafter=['a']", "exactly one of"),
+        ("[job.a]\ncommand='true'", "exactly one of"),
         (
             "[job.x]\nschedule='0 3 * * *'\ncommand='true'\non_lost='maybe'",
             "on_lost must be",
@@ -143,6 +145,41 @@ def test_unknown_top_level_table_is_rejected(tmp_path):
     cfg = write(tmp_path, "[nonsense]\nx = 1\n[job.x]\nschedule='@hourly'\ncommand='true'")
     with pytest.raises(ConfigError, match="unknown top-level"):
         load_config(cfg)
+
+
+def test_dependency_cycle_is_rejected(tmp_path):
+    cfg = write(
+        tmp_path,
+        """
+        [job.a]
+        command = "true"
+        after = ["c"]
+        [job.b]
+        command = "true"
+        after = ["a"]
+        [job.c]
+        command = "true"
+        after = ["b"]
+        """,
+    )
+    with pytest.raises(ConfigError, match="dependency cycle"):
+        load_config(cfg)
+
+
+def test_triggered_job_needs_no_schedule(tmp_path):
+    cfg = write(
+        tmp_path,
+        """
+        [job.up]
+        schedule = "0 * * * *"
+        command = "true"
+        [job.down]
+        command = "true"
+        after = ["up"]
+        """,
+    )
+    down = {j.name: j for j in load_config(cfg).jobs}["down"]
+    assert down.triggered and down.schedule is None
 
 
 @pytest.mark.parametrize(
