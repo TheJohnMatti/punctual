@@ -406,8 +406,11 @@ quarantined / degraded job succeeds again — M3 slice 1).
   - *slice 1 ✅* — `schedule` XOR `after`, cycle rejection, `_dispatch_triggered`
     (fresh-success trigger + fan-in), `on_upstream_failure` skip/run/wait,
     `runs.note`.
-  - *slice 2* — `plan` / `why` / `tui` / a `punctual graph` show the edges and
-    *why* a job is waiting or was skipped.
+  - *slice 2 ✅* — `introspect._upstream_status` (read-only twin of the trigger
+    gate) → `why` shows `trigger: ready/waiting/blocked` + per-upstream ✓/…/✗
+    and `feeds: <downstreams>`; `plan` annotates triggered jobs with what
+    they're waiting on; `tui` detail panel likewise. New `punctual graph`
+    (`--format text` tree / `dot` for graphviz).
   - *slice 3* — `on_upstream_failure = "wait"` timeout; partial fan-in;
     re-trigger after a downstream config change.
 - **M5 — cluster**: lease-based leader election, fencing tokens, Postgres store.

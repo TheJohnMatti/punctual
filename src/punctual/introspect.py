@@ -32,7 +32,40 @@ def _run_brief(r: Run) -> dict[str, Any]:
     }
 
 
-def explain_job(job: Job, store: Store, now: datetime | None = None) -> dict[str, Any]:
+def _upstream_status(job: Job, store: Store) -> dict[str, Any]:
+    """Per-upstream readiness for a triggered job (O12) — the read-only twin of
+    the scheduler's `_dispatch_triggered` gate."""
+    last = store.job_state(job.name).last_fire
+    ups: list[dict[str, Any]] = []
+    for up in job.after:
+        ok = store.last_success_fire(up)
+        lr = store.last_run(up)
+        if ok is not None and (last is None or ok > last):
+            state = "ready"
+        elif lr and lr.state in FAILURE_OUTCOMES and (last is None or lr.scheduled_for > last):
+            state = "failed"
+        else:
+            state = "pending"
+        ups.append(
+            {
+                "job": up,
+                "state": state,
+                "last_success": _iso(ok),
+                "last_run_state": lr.state.value if lr else None,
+            }
+        )
+    if any(u["state"] == "failed" for u in ups):
+        overall = "blocked"
+    elif ups and all(u["state"] == "ready" for u in ups):
+        overall = "ready"
+    else:
+        overall = "waiting"
+    return {"trigger_state": overall, "upstreams": ups}
+
+
+def explain_job(
+    job: Job, store: Store, now: datetime | None = None, all_jobs: list[Job] | None = None
+) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     st = store.job_state(job.name)
     recent = store.history(job.name, limit=1)
@@ -64,10 +97,15 @@ def explain_job(job: Job, store: Store, now: datetime | None = None) -> dict[str
             "probe_at": _iso(cooldown_at),
         }
 
+    downstreams = (
+        sorted(j.name for j in all_jobs if job.name in j.after) if all_jobs is not None else None
+    )
     return {
         "job": job.name,
         "schedule": job.schedule,
         "after": job.after or None,
+        "downstreams": downstreams or None,
+        "depends": _upstream_status(job, store) if job.triggered else None,
         "timezone": job.timezone,
         "enabled": job.enabled,
         "health": health,

@@ -67,3 +67,23 @@ def test_explain_run_tells_the_retry_story(tmp_path):
     assert r2["prior_attempts"] == [{"attempt": 1, "state": "failed", "exit_code": 1}]
     assert r2["what_happened_next"] == "succeeded after 1 failed attempt(s)"
     store.close()
+
+
+def test_explain_job_dependency_state(tmp_path):
+    store = SqliteStore(tmp_path / "s.db")
+    up = Job(name="scrape", schedule="0 * * * *", command=["true"])
+    down = Job(name="proc", schedule=None, command=["true"], after=["scrape"])
+
+    r = explain_job(down, store, all_jobs=[up, down])
+    assert r["depends"]["trigger_state"] == "waiting"  # no scrape success yet
+    assert r["depends"]["upstreams"][0]["state"] == "pending"
+    assert explain_job(up, store, all_jobs=[up, down])["downstreams"] == ["proc"]
+
+    # scrape succeeds -> proc is ready
+    s = store.claim("scrape", _fire(), "t")
+    s.transition_to(RunState.RUNNING)
+    s.transition_to(RunState.SUCCEEDED)
+    store.mark(s)
+    r = explain_job(down, store, all_jobs=[up, down])
+    assert r["depends"]["trigger_state"] == "ready"
+    store.close()
