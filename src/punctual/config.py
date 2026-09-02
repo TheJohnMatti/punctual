@@ -36,6 +36,7 @@ _JOB_KEYS = {
     "timeout",
     "after",
     "on_upstream_failure",
+    "wait_timeout",
     "idempotent",
     "on_lost",
     "catch_up_cap",
@@ -167,6 +168,8 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
         job.timeout = parse_duration(raw["timeout"])
     if "quarantine_cooldown" in raw:
         job.quarantine_cooldown = parse_duration(raw["quarantine_cooldown"])
+    if "wait_timeout" in raw:
+        job.wait_timeout = parse_duration(raw["wait_timeout"])
     return job
 
 

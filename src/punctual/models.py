@@ -128,6 +128,7 @@ class Job:
     schedule: str | None = None  # cron expr — exactly one of schedule / after (O12)
     after: list[str] = field(default_factory=list)  # upstreams; this job is trigger-driven
     on_upstream_failure: UpstreamFailure = UpstreamFailure.SKIP
+    wait_timeout: timedelta | None = None  # WAIT: fall back to skip after this long
     timezone: str = "UTC"  # IANA name - DESIGN O1 sub-decision
     missed: MissedPolicy = MissedPolicy.RUN_LATEST
     retries: RetryPolicy = field(default_factory=RetryPolicy)

@@ -48,6 +48,7 @@ $ punctual history retrain     # every run: when, how long, exit code, output
 $ punctual why retrain         # health, last run, pending retry, next fire
 $ punctual why retrain 412     # explain one run: trigger, attempts, what happened next
 $ punctual graph               # the `after` dependency tree (--format dot for graphviz)
+$ punctual trigger backup      # run a job now (ignore schedule / after / quarantine)
 $ punctual resume retrain      # take a job out of quarantine
 $ punctual reload              # apply added / removed jobs without a restart
 $ punctual stop --kill         # drain (or hard-kill) the running daemon
@@ -86,15 +87,15 @@ $ punctual -c ~/.config/punctual/punctual.toml history
 State lives in `~/.local/state/punctual/punctual.db` (override with `$PUNCTUAL_DB`).
 To keep it running, install a service — see [`packaging/`](packaging/).
 
-> **What works today (M1 + M2 + M3 + M4 slice 1):** scheduling, `after`
-> dependencies (trigger-driven, fan-in, upstream-failure policy), subprocess exec
-> with output capture + timeouts, durable history, restart recovery + catch-up,
-> retries with backoff, a quarantine circuit-breaker, failure/recovery
-> notifications (`ntfy` / `slack` / `discord` / `exec` / webhook / plugins),
-> `why` / `status` / annotated `plan`, a control socket (`drain` / `stop` /
-> `reload`), Prometheus `/metrics` + `/healthz`, structured JSON logs
-> (`--log-format json`), and a read-only TUI. **Not yet:** a dependency graph
-> view, clustering (M5). See [`docs/DESIGN.md`](docs/DESIGN.md).
+> **What works today (M1–M4):** scheduling, `after` dependencies (trigger-driven,
+> fan-in, upstream-failure policy, `wait_timeout`), `punctual trigger` for an
+> ad-hoc run, subprocess exec with output capture + timeouts, durable history,
+> restart recovery + catch-up, retries with backoff, a quarantine circuit-breaker,
+> failure/recovery notifications (`ntfy` / `slack` / `discord` / `exec` / webhook
+> / plugins), `why` / `status` / annotated `plan` / `graph`, a control socket
+> (`drain` / `stop` / `reload`), Prometheus `/metrics` + `/healthz`, structured
+> JSON logs (`--log-format json`), and a read-only TUI. **Not yet:** clustering
+> (M5), durable in-process `@step` (M6). See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 

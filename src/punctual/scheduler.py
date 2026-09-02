@@ -84,6 +84,8 @@ class Scheduler:
     _last_tick: float = field(default_factory=time.monotonic, init=False)  # monotonic
     _loop_lag: float = 0.0
     _downstreams: dict[str, list[str]] = field(default_factory=dict, init=False)  # up -> [down]
+    _adhoc: list[str] = field(default_factory=list, init=False)  # `punctual trigger` queue
+    _blocked_since: dict[str, datetime] = field(default_factory=dict, init=False)  # wait_timeout
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -103,6 +105,7 @@ class Scheduler:
                         tg.create_task(self._run_sequence(job, fires))
 
                 while not self._stopping.is_set():
+                    self._dispatch_adhoc(tg)
                     self._dispatch_due(tg)
                     self._sweep_retries(tg)
                     self._dispatch_triggered(tg)
@@ -163,6 +166,15 @@ class Scheduler:
 
     def in_flight(self) -> int:
         return len(self._running)
+
+    def trigger(self, job: str) -> dict[str, object]:
+        """`punctual trigger <job>` — run it now, ignoring schedule / `after` /
+        quarantine. `scheduled_for` = now."""
+        if self._job(job) is None:
+            return {"ok": False, "error": f"no job named {job!r}"}
+        self._adhoc.append(job)
+        self._wake.set()
+        return {"ok": True, "job": job}
 
     def control_status(self) -> dict[str, object]:
         import os
@@ -379,6 +391,25 @@ class Scheduler:
                 continue  # already claimed (another daemon, or recovery)
             self._launch(job, run, tg)
 
+    def _dispatch_adhoc(self, tg: asyncio.TaskGroup) -> None:
+        while self._adhoc:
+            name = self._adhoc.pop(0)
+            job = self._job(name)
+            if job is None:
+                continue
+            fire = datetime.now(UTC).replace(microsecond=0)
+            run = self.store.claim(name, fire, self.instance_id)
+            if run is None:  # a natural fire already claimed this exact second
+                log.warning("%s: manual trigger collided with a scheduled fire — ignored", name)
+                continue
+            run.note = "manual trigger"
+            log.info(
+                "%s: manual trigger",
+                name,
+                extra={"event": "triggered", "job": name, "manual": True},
+            )
+            self._launch(job, run, tg)
+
     # --- dependencies (O12) ------------------------------------------
     def _dispatch_triggered(self, tg: asyncio.TaskGroup) -> None:
         for job in self._enabled():
@@ -418,6 +449,7 @@ class Scheduler:
             elif self._inflight[job.name] < job.concurrency:
                 run = self.store.claim(job.name, ready_at, self.instance_id)
                 if run is not None:
+                    self._blocked_since.pop(job.name, None)
                     log.info(
                         "%s triggered by %s (fire %s)",
                         job.name,
@@ -431,16 +463,28 @@ class Scheduler:
         self, job: Job, upstream: str, fire: datetime, tg: asyncio.TaskGroup
     ) -> None:
         if job.on_upstream_failure is UpstreamFailure.WAIT:
-            return  # hold; re-check next tick (slice 3 adds a timeout)
-        if job.on_upstream_failure is UpstreamFailure.RUN:
+            since = self._blocked_since.setdefault(job.name, datetime.now(UTC))
+            waited = datetime.now(UTC) - since
+            if job.wait_timeout is None or waited < job.wait_timeout:
+                return  # keep holding — re-check next tick
+            log.warning(
+                "%s: waited %s on upstream %s > wait_timeout — giving up",
+                job.name,
+                waited,
+                upstream,
+            )
+            # fall through to SKIP
+        elif job.on_upstream_failure is UpstreamFailure.RUN:
             if self._inflight[job.name] < job.concurrency:
                 run = self.store.claim(job.name, fire, self.instance_id)
                 if run is not None:
+                    self._blocked_since.pop(job.name, None)
                     run.note = f"ran despite upstream {upstream} failure"
                     log.warning("%s: running despite upstream %s failure", job.name, upstream)
                     self._launch(job, run, tg)
             return
-        # SKIP (default)
+        # SKIP (default, or WAIT that timed out)
+        self._blocked_since.pop(job.name, None)
         note = f"upstream {upstream} failed"
         if self.store.record_skip(job.name, fire, self.instance_id, note) is not None:
             log.warning(

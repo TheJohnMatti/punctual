@@ -392,6 +392,19 @@ def stop(kill: bool, timeout: float) -> None:
 
 
 @main.command()
+@click.argument("job")
+@click.pass_context
+def trigger(ctx: click.Context, job: str) -> None:
+    """Run a job now — ignoring its schedule / `after` gate / quarantine."""
+    if job not in {j.name for j in _load(ctx)}:
+        raise click.ClickException(f"no job named {job!r} in the config")
+    r = _talk("trigger", job=job)
+    if not r.get("ok"):
+        raise click.ClickException(str(r.get("error")))
+    click.secho(f"{job}: triggered — check `punctual history {job}`", fg="green")
+
+
+@main.command()
 def reload() -> None:
     """Re-read the config: add new jobs, drop removed ones (changed jobs need a restart)."""
     r = _talk("reload")
