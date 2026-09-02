@@ -7,6 +7,8 @@ at 3am.
 
 from __future__ import annotations
 
+import importlib
+import sys
 import tomllib
 from datetime import timedelta
 from pathlib import Path
@@ -14,6 +16,7 @@ from typing import Any
 
 from croniter import croniter
 
+from punctual import registry
 from punctual.models import (
     Backoff,
     Config,
@@ -58,8 +61,10 @@ class ConfigError(ValueError):
     pass
 
 
-def parse_duration(text: str | int | float) -> timedelta:
+def parse_duration(text: str | int | float | timedelta) -> timedelta:
     """'45m' -> timedelta(minutes=45). Bare numbers are seconds."""
+    if isinstance(text, timedelta):  # an @punctual.job passed one directly
+        return text
     if isinstance(text, (int, float)):
         return timedelta(seconds=float(text))
     text = text.strip().lower()
@@ -85,7 +90,9 @@ def _as_argv(command: str | list[str], job: str) -> list[str]:
     raise ConfigError(f"job {job!r}: command must be a string or list of strings")
 
 
-def _retry_policy(raw: dict[str, Any], job: str) -> RetryPolicy:
+def _retry_policy(raw: dict[str, Any] | RetryPolicy, job: str) -> RetryPolicy:
+    if isinstance(raw, RetryPolicy):  # an @punctual.job passed one directly
+        return raw
     unknown = set(raw) - _RETRY_KEYS
     if unknown:
         raise ConfigError(f"job {job!r}: unknown retries keys {sorted(unknown)}")
@@ -176,6 +183,50 @@ def _build_job(name: str, raw: dict[str, Any]) -> Job:
 
 _OBSERVABILITY_KEYS = {"metrics_addr", "metrics_port"}
 _STORE_KEYS = {"url"}
+_PYTHON_KEYS = {"modules"}
+
+
+def _python_modules(raw: dict[str, Any]) -> list[str]:
+    unknown = set(raw) - _PYTHON_KEYS
+    if unknown:
+        raise ConfigError(f"[python]: unknown keys {sorted(unknown)}")
+    mods = raw.get("modules", [])
+    if not isinstance(mods, list) or not all(isinstance(m, str) for m in mods):
+        raise ConfigError("[python]: 'modules' must be a list of import paths")
+    return list(mods)
+
+
+def _load_python_jobs(modules: list[str]) -> list[Job]:
+    """Import each module (runs the ``@punctual.job`` decorators) and turn every
+    registration into a :class:`Job` that re-execs ``python -m punctual._inproc``.
+
+    Not cleared between calls: an already-imported module won't re-run its
+    decorators, so the registry has to persist. Dropping a module from the config
+    without a daemon restart leaves its jobs registered — matches ``reload``'s
+    "changed jobs need a restart" rule.
+    """
+    if modules and "" not in sys.path and str(Path.cwd()) not in sys.path:
+        sys.path.insert(0, "")  # resolve a job module living in the daemon's cwd
+    for mod in modules:
+        try:
+            importlib.import_module(mod)
+        except ImportError as e:
+            raise ConfigError(f"[python]: cannot import {mod!r}: {e}") from e
+
+    wanted = set(modules)
+    jobs = []
+    for name, (fn, options) in registry.registered().items():
+        if fn.__module__ not in wanted:
+            continue  # a registration left over from a different config in this process
+        ref = f"{fn.__module__}:{fn.__qualname__}"
+        raw = {**options, "command": [sys.executable, "-m", "punctual._inproc", ref]}
+        try:
+            job = _build_job(name, raw)
+        except ConfigError as e:
+            raise ConfigError(f"@punctual.job({name!r}): {e}") from e
+        job.python_ref = ref
+        jobs.append(job)
+    return jobs
 
 
 def _store(raw: dict[str, Any]) -> StoreConfig:
@@ -215,17 +266,24 @@ def load_config(path: str | Path) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}") from e
 
-    unknown_top = set(doc) - {"job", "observability", "store"}
+    unknown_top = set(doc) - {"job", "observability", "store", "python"}
     if unknown_top:
         raise ConfigError(f"{path}: unknown top-level table(s) {sorted(unknown_top)}")
 
+    python_modules = _python_modules(doc.get("python", {}))
+    py_jobs = _load_python_jobs(python_modules)
+
     jobs_table = doc.get("job", {})
-    if not jobs_table:
-        raise ConfigError(f"{path}: no [job.*] tables defined")
+    if not jobs_table and not py_jobs:
+        raise ConfigError(f"{path}: no [job.*] tables or [python] modules defined")
 
-    jobs = [_build_job(name, raw) for name, raw in jobs_table.items()]
+    jobs = py_jobs + [_build_job(name, raw) for name, raw in jobs_table.items()]
 
-    names = {j.name for j in jobs}
+    names: set[str] = set()
+    for j in jobs:
+        if j.name in names:
+            raise ConfigError(f"job {j.name!r} is defined twice (TOML and @punctual.job?)")
+        names.add(j.name)
     for j in jobs:
         for dep in j.after:
             if dep not in names:
@@ -235,6 +293,7 @@ def load_config(path: str | Path) -> Config:
         jobs=jobs,
         observability=_observability(doc.get("observability", {})),
         store=_store(doc.get("store", {})),
+        python_modules=python_modules,
     )
 
 

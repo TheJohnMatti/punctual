@@ -5,6 +5,9 @@
 #                                                            # (needs the [postgres] extra);
 #                                                            # omit for the default SQLite file
 
+# [python]
+# modules = ["myapp.jobs"]     # import these; @punctual.job functions become jobs
+
 [observability]
 metrics_port = 9095          # serve GET /metrics + /healthz on 127.0.0.1:9095
 

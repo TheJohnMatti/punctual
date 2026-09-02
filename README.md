@@ -61,6 +61,29 @@ serves `GET /metrics` (per-job counters, run-duration histogram,
 `punctual_time_since_last_success_seconds` — the SLO gauge) and `GET /healthz`
 on `127.0.0.1:9095`.
 
+### Python jobs
+
+A job can be a Python function instead of a command:
+
+```python
+# myapp/jobs.py
+from punctual import job
+
+
+@job("reindex", schedule="0 * * * *", retries={"max": 2}, timeout="30m")
+def reindex(): ...
+```
+
+```toml
+# punctual.toml
+[python]
+modules = ["myapp.jobs"]     # the daemon imports these; decorators register the jobs
+```
+
+The function runs in its own subprocess (`python -m punctual._inproc …`), so it
+gets the same process-group kill, timeout, output capture and crash recovery as
+a shell command. TOML `[job.*]` tables and `@job` functions mix freely.
+
 ## Quickstart
 
 ```console
@@ -125,8 +148,9 @@ url = "postgresql://punctual:secret@db.internal:5432/punctual"
 > / plugins), `why` / `status` / annotated `plan` / `graph`, a control socket
 > (`drain` / `stop` / `reload`), Prometheus `/metrics` + `/healthz`, structured
 > JSON logs (`--log-format json`), a read-only TUI, lease-based leader election
-> (`run --cluster`), and a Postgres store. **Not yet:** durable in-process
-> `@step` (M6). See [`docs/DESIGN.md`](docs/DESIGN.md).
+> (`run --cluster`), a Postgres store, and `@punctual.job` Python jobs.
+> **Not yet:** durable in-job `step()` checkpoints (M6 slice 2). See
+> [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Design principles
 

@@ -14,9 +14,18 @@ from collections.abc import Iterator
 
 import pytest
 
+from punctual import registry
 from punctual.store import PostgresStore, SqliteStore, Store
 
 _PG_ADMIN_DSN = os.environ.get("PUNCTUAL_TEST_PG_DSN")
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry() -> Iterator[None]:
+    """@punctual.job registrations are process-global — reset around every test."""
+    registry.clear()
+    yield
+    registry.clear()
 
 
 @pytest.fixture(params=["sqlite", "postgres"])

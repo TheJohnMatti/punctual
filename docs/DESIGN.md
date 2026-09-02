@@ -379,6 +379,39 @@ available as that host, so clustering needs Postgres.
   `postgres:16` service; the `store` fixture makes a throwaway database per
   test (xdist-safe).
 
+### O14 — In-process Python jobs  *(built — M6 slice 1)*
+`@punctual.job("name", schedule="…", retries={"max": 2}, …)` on a zero-arg
+function makes it a scheduled job. `[python] modules = ["myapp.jobs"]` in
+punctual.toml tells the daemon which modules to import (importing runs the
+decorators). TOML `[job.*]` tables still work and mix freely; a name defined
+both ways is an error.
+
+- **Decision: subprocess re-exec, not in-daemon.** The synthesised `command` is
+  `python -m punctual._inproc <module>:<func>` — so a Python job goes through the
+  *exact same* executor path as a shell job: own process group, `timeout` /
+  `stop --kill`, output tail, the `_runner` exit sentinel, LOST recovery. An
+  in-daemon threadpool would save ~40 ms of interpreter startup but a hung or
+  segfaulting job would take the scheduler with it, and `timeout` couldn't
+  actually interrupt. Not worth it for background jobs.
+- **Decision: decorator-primary.** Schedule + retry/timeout/notify policy live
+  next to the code, in the same place a reader looks to understand the function.
+  Config-as-the-only-place would keep the function punctual-agnostic but split
+  every job's definition across two files.
+- **`_build_job` is reused verbatim** — the decorator's kwargs go through the
+  same coercion and validation as a TOML table (durations, retry dicts, the
+  `schedule` XOR `after` rule, unknown-key rejection), so there's one schema,
+  not two. `parse_duration` / `_retry_policy` also accept an already-built
+  `timedelta` / `RetryPolicy` for the Python caller.
+- **The registry is process-global and not cleared between `load_config`
+  calls** — an already-imported module won't re-run its decorators, so the
+  registrations have to persist (the TUI reloads config every second). Dropping
+  a module from the config needs a daemon restart to take effect, same as
+  `reload`'s rule for changed jobs.
+- `_inproc` and `_load_python_jobs` both put `""` (cwd) on `sys.path`, so
+  `modules = ["myjobs"]` resolves when the daemon runs from the project dir; an
+  installed package resolves regardless.
+- **M6 slice 2:** `step(name, fn)` durable checkpoints *inside* a job body.
+
 ### O10 — Notifications  *(built — M2 slice 2 + M3 slice 4)*
 Three hooks, `str | None` URIs on `Job`: **`on_fail`** (a fire exhausts its
 retries), **`on_quarantine`** (the breaker opens), **`on_recovery`** (a
@@ -482,4 +515,10 @@ quarantined / degraded job succeeds again — M3 slice 1).
     `[postgres]` extra); `[store] url` / `$PUNCTUAL_STORE_URL` selector;
     `claim` → `ON CONFLICT … RETURNING`; `test-postgres` CI job (real
     `postgres:16`, throwaway DB per test). **⇒ M5 done.**
-- **M6 — durable steps**: `@punctual.step` in-process checkpointing.
+- **M6 — Python jobs + durable steps** (O14). Slices:
+  - *slice 1 ✅* — `@punctual.job` decorator + `punctual/registry.py`;
+    `[python] modules` config; `punctual/_inproc.py` re-exec entry point; jobs
+    built through the same `_build_job` as TOML; `validate` / `why` show
+    `py <module>:<func>`.
+  - *slice 2* — `step(name, fn)`: run once, cache the JSON result keyed by
+    `(job, scheduled_for, name)` so a retry skips completed steps.

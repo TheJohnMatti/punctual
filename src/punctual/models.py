@@ -145,6 +145,7 @@ class Job:
     workdir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+    python_ref: str | None = None  # M6: "module:function" for an @punctual.job; None for shell
 
     @property
     def effective_on_lost(self) -> OnLost:
@@ -186,6 +187,7 @@ class Config:
     jobs: list[Job]
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     store: StoreConfig = field(default_factory=StoreConfig)
+    python_modules: list[str] = field(default_factory=list)  # [python] modules — @punctual.job
 
 
 @dataclass(slots=True)

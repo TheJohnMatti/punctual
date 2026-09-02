@@ -76,6 +76,7 @@ source = ["punctual"]
 branch = true
 omit = [
     "src/punctual/_runner.py",  # only ever runs as a subprocess; covered by test_retries
+    "src/punctual/_inproc.py",  # ditto — exercised via subprocess in test_registry
 ]
 
 [tool.coverage.report]
